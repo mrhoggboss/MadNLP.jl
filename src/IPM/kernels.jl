@@ -16,6 +16,23 @@ function set_aug_diagonal!(kkt::AbstractKKTSystem{T}, solver::AbstractMadNLPSolv
     copyto!(kkt.u_lower, get_zu_r(solver))
 
     _set_aug_diagonal!(kkt)
+    # Inject the penalty Hessian D_s onto the equality-slack diagonal (no-op for any other
+    # equality treatment). Done here, after the barrier diagonal, so every assembly phase
+    # (regular/restore/robust/dual-init) gets it; build_kkt! then folds it into both the
+    # augmented and the condensed (1,1) block.
+    add_penalty_diagonal!(kkt, solver, get_cb(solver).equality_handler, slack(get_x(solver)))
+    return
+end
+
+add_penalty_diagonal!(kkt, solver, ::AbstractEqualityTreatment, s) = nothing
+function add_penalty_diagonal!(kkt, solver, eh::KernelPenaltyEquality, s)
+    n = length(kkt.pr_diag) - length(s)        # number of (non-slack) primal variables
+    es = eh.ind_eqslack
+    μ = eh.muP[]
+    dview = view(kkt.pr_diag, n .+ es)
+    dview .+= kernel_hess.(Ref(eh.kernel), μ, view(s, es))
+    # cosh overflow error: a non-finite D_s terminates the solve with a clear message.
+    is_valid(dview) || _penalty_overflow(solver, eh, :hess)
     return
 end
 

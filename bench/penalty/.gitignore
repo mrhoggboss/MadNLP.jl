@@ -1,0 +1,2 @@
+# Machine-local: pins a dev'd HSL_jll path; re-instantiate locally to run the gate.
+Manifest.toml

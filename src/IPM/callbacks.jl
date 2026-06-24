@@ -1,3 +1,55 @@
+# Penalty contributions for the `KernelPenaltyEquality` treatment. Both dispatch to a
+# no-op for any other treatment, so non-penalty solves are untouched. The penalty acts on
+# the equality slacks `view(s, ind_eqslack)`; broadcasts/reductions over that view are
+# GPU-safe (no scalar indexing). See `src/Callbacks/equality_kernels.jl`.
+#
+# The kernels are NOT overflow-safe: if `cosh(μ s)` overflows, the penalty term is
+# non-finite and we terminate the solve loudly (rather than silently saturating, which
+# would corrupt the Newton step). `_penalty_overflow` logs a clear, actionable message and
+# throws `InvalidNumberException`, which `solve!` turns into an `INVALID_NUMBER_*` status.
+@noinline function _penalty_overflow(solver, eh::KernelPenaltyEquality, sym::Symbol)
+    @error(get_logger(solver), string(
+        "KernelPenaltyEquality: penalty kernel ", nameof(typeof(eh.kernel)),
+        " produced a non-finite ", sym, " term (μ_P = ", eh.muP[],
+        "). The penalty is too stiff at the current iterate — reduce muP, apply a ",
+        "μ-continuation schedule, or use CoshNormalizedKernel / QuadraticKernel."))
+    throw(InvalidNumberException(sym))
+end
+
+# Pure equality-penalty sum `Σ φ(μ, sᵢ)` over the current slacks; `zero` for any non-penalty
+# treatment. No overflow check — used both inside eval_f_wrapper and when stripping the
+# penalty back out to report the true objective.
+penalty_objective(::AbstractEqualityTreatment, s) = zero(eltype(s))
+function penalty_objective(eh::KernelPenaltyEquality, s)
+    μ = eh.muP[]
+    se = view(s, eh.ind_eqslack)
+    return mapreduce(si -> kernel_val(eh.kernel, μ, si), +, se; init = zero(eltype(s)))
+end
+
+# Checked version used by eval_f_wrapper: terminate the solve if the penalty overflowed.
+function penalty_objective(solver, eh::AbstractEqualityTreatment, s)
+    pen = penalty_objective(eh, s)
+    is_valid(pen) || _penalty_overflow(solver, eh, :obj)
+    return pen
+end
+
+# `get_obj_val(solver)` carries the equality penalty folded in by eval_f_wrapper. This
+# strips it back out, recovering the true model objective `f(x)` in MadNLP's internal
+# (scaled, sign-flipped) space — what should be *reported* to the user. The penalty stays in
+# the merit/filter (via `get_obj_val`). No-op (subtracts 0) for every non-penalty treatment.
+true_obj_val(solver) = get_obj_val(solver) - penalty_objective(get_cb(solver).equality_handler, slack(get_x(solver)))
+
+penalty_gradient!(solver, ::AbstractEqualityTreatment, sf, s) = nothing
+function penalty_gradient!(solver, eh::KernelPenaltyEquality, sf, s)
+    μ = eh.muP[]
+    es = eh.ind_eqslack
+    # Overwrite (not accumulate): `slack(f)` persists across iterations and is otherwise 0,
+    # so only the equality-slack entries carry φ'(s); the rest must stay 0.
+    @views sf[es] .= kernel_grad.(Ref(eh.kernel), μ, s[es])
+    is_valid(view(sf, es)) || _penalty_overflow(solver, eh, :grad)
+    return
+end
+
 function eval_f_wrapper(solver::AbstractMadNLPSolver{T}, x::PrimalVector{T}) where T
     nlp = get_nlp(solver)
     cnt = get_cnt(solver)
@@ -8,6 +60,9 @@ function eval_f_wrapper(solver::AbstractMadNLPSolver{T}, x::PrimalVector{T}) whe
         # to the user (in MadNLPExecutionStats) we flip it back (#517).
         sense = (get_minimize(nlp) ? one(T) : -one(T))
         obj_val = sense * _eval_f_wrapper(get_cb(solver), variable(x))
+        # Add the equality penalty in the (minimized) internal objective space (#517),
+        # so the filter / merit see it.
+        obj_val += penalty_objective(solver, get_cb(solver).equality_handler, slack(x))
     end
     cnt.obj_cnt += 1
     if cnt.obj_cnt == 1 && !is_valid(obj_val)
@@ -28,6 +83,9 @@ function eval_grad_f_wrapper!(solver::AbstractMadNLPSolver, f::PrimalVector{T}, 
     if !get_minimize(nlp)
         variable(f) .*= -one(T)
     end
+    # Penalty gradient on the equality slacks → KKT RHS and dual-infeasibility (both read
+    # full(f)). Stationarity on those rows becomes φ'(s) = y.
+    penalty_gradient!(solver, get_cb(solver).equality_handler, slack(f), slack(x))
     cnt.obj_grad_cnt+=1
 
     if cnt.obj_grad_cnt == 1 && !is_valid(full(f))

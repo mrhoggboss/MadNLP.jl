@@ -35,7 +35,7 @@ function MadNLPExecutionStats(solver::AbstractMadNLPSolver{T}) where {T}
         get_opt(solver),
         get_status(solver),
         x,
-        unpack_obj(get_cb(solver), get_obj_val(solver)),
+        unpack_obj(get_cb(solver), true_obj_val(solver)),
         c,
         get_inf_du(solver),
         get_inf_pr(solver),
@@ -53,7 +53,7 @@ function update!(stats::MadNLPExecutionStats, solver::AbstractMadNLPSolver)
     unpack_y!(stats.multipliers, get_cb(solver), get_y(solver))
     unpack_z!(stats.multipliers_L, get_cb(solver), variable(get_zl(solver)))
     unpack_z!(stats.multipliers_U, get_cb(solver), variable(get_zu(solver)))
-    stats.objective = unpack_obj(get_cb(solver), get_obj_val(solver))
+    stats.objective = unpack_obj(get_cb(solver), true_obj_val(solver))   # report f(x*), penalty stripped
     unpack_cons!(stats.constraints, get_cb(solver), get_c(solver))
     stats.constraints .+= get_rhs(solver)
     stats.constraints[get_ind_ineq(solver)] .+= slack(get_x(solver))
@@ -160,8 +160,13 @@ end
 
 function print_iter(solver::AbstractMadNLPSolver; is_resto=false)
     obj_scale = get_cb(solver).obj_scale[]
+    # When penalizing equalities, the `objective` column is the merit (penalty folded in);
+    # also show the true model objective in an extra `true_obj` column. Standard solves are
+    # unchanged (suffix empty).
+    is_pen = _is_kernel_penalty(get_cb(solver).equality_handler)
     mod(get_cnt(solver).k,10)==0&& @info(get_logger(solver),@sprintf(
-        "iter    objective    inf_pr   inf_du inf_compl lg(mu) lg(rg) alpha_pr ir ls"))
+        "iter    objective    inf_pr   inf_du inf_compl lg(mu) lg(rg) alpha_pr ir ls%s",
+        is_pen ? "      true_obj" : ""))
     if is_resto
         RR = get_RR(solver)::RobustRestorer
         inf_du = RR.inf_du_R
@@ -175,7 +180,7 @@ function print_iter(solver::AbstractMadNLPSolver; is_resto=false)
         mu = log10(get_mu(solver))
     end
     @info(get_logger(solver),@sprintf(
-        "%4i%s% 10.7e %6.2e %6.2e %7.2e %5.1f  %s  %6.2e %2i %2i%s",
+        "%4i%s% 10.7e %6.2e %6.2e %7.2e %5.1f  %s  %6.2e %2i %2i%s%s",
         get_cnt(solver).k,is_resto ? "r" : " ",get_obj_val(solver)/obj_scale,
         inf_pr, inf_du, inf_compl, mu,
         # get_cnt(solver).k == 0 ? 0. : norm(primal(get_d(solver)),Inf),
@@ -183,7 +188,8 @@ function print_iter(solver::AbstractMadNLPSolver; is_resto=false)
         get_alpha(solver),
         get_cnt(solver).ir,
         get_cnt(solver).l,
-        get_ftype(solver),))
+        get_ftype(solver),
+        is_pen ? @sprintf("  % 10.7e", true_obj_val(solver)/obj_scale) : "",))
     return
 end
 
@@ -195,7 +201,7 @@ function print_summary(solver::AbstractMadNLPSolver)
     @notice(get_logger(solver),"")
     @notice(get_logger(solver),"Number of Iterations....: $(get_cnt(solver).k)\n")
     @notice(get_logger(solver),"                                   (scaled)                 (unscaled)")
-    @notice(get_logger(solver),@sprintf("Objective...............:  % 1.16e   % 1.16e",get_obj_val(solver),get_obj_val(solver)/obj_scale))
+    @notice(get_logger(solver),@sprintf("Objective...............:  % 1.16e   % 1.16e",true_obj_val(solver),true_obj_val(solver)/obj_scale))
     @notice(get_logger(solver),@sprintf("Dual infeasibility......:   %1.16e    %1.16e",get_inf_du(solver),get_inf_du(solver)/obj_scale))
     @notice(get_logger(solver),@sprintf("Constraint violation....:   %1.16e    %1.16e",norm(get_c(solver),Inf),get_inf_pr(solver)))
     @notice(get_logger(solver),@sprintf("Complementarity.........:   %1.16e    %1.16e",

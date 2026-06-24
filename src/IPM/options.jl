@@ -144,7 +144,9 @@ tau\\_min                      | 0.99                 | lower bound on fraction-
     # NLP options
     kappa_d::T = 1e-5
     fixed_variable_treatment::Type = kkt_system <: MadNLP.SparseCondensedKKTSystem ? MadNLP.RelaxBound : MadNLP.MakeParameter
-    equality_treatment::Type = kkt_system <: MadNLP.SparseCondensedKKTSystem ? MadNLP.RelaxEquality : MadNLP.EnforceEquality
+    # Accepts either a treatment *type* (e.g. the default `EnforceEquality`) or a
+    # constructed *instance* (e.g. `KernelPenaltyEquality(CoshKernel(); muP=…)`).
+    equality_treatment::Union{Type,MadNLP.AbstractEqualityTreatment} = kkt_system <: MadNLP.SparseCondensedKKTSystem ? MadNLP.RelaxEquality : MadNLP.EnforceEquality
     bound_relax_factor::T = 1e-8
     jacobian_constant::Bool = false
     hessian_constant::Bool = false

@@ -15,6 +15,7 @@ import LDLFactorizations
 import MUMPS_seq_jll, OpenBLAS32_jll
 
 export MadNLPSolver, MadNLPOptions, LDLSolver, LapackCPUSolver, MumpsSolver, MadNLPExecutionStats, madnlp, solve!, madsuite, SchurComplementKKTSystem
+export KernelPenaltyEquality, AbstractEqualityKernel, QuadraticKernel, CoshKernel, CoshNormalizedKernel, AbstractPenaltySchedule, FixedPenalty
 Base.USE_GPL_LIBS && export UmfpackSolver, CHOLMODSolver
 
 function __init__()
@@ -32,6 +33,7 @@ introduce() = "\033[34mMad\033[31mN\033[32mL\033[35mP\033[0m version v$(version(
 include("enums.jl")
 include("utils.jl")
 include("matrixtools.jl")
+include(joinpath("Callbacks", "equality_kernels.jl"))
 include(joinpath("Callbacks", "nlpmodels.jl"))
 include(joinpath("Callbacks", "wrappers.jl"))
 include("quasi_newton.jl")

@@ -213,37 +213,45 @@ color_status(status::Status) =
     status <= SOLVED_TO_ACCEPTABLE_LEVEL ? :blue : :red
 
 
+# Advance the penalty parameter μ of a KernelPenaltyEquality handler once per iteration,
+# via its pluggable schedule. No-op for every other equality treatment, and for the
+# Stage-1 `FixedPenalty` schedule (μ held at its initial value).
+update_penalty_mu!(solver::AbstractMadNLPSolver) = _update_penalty_mu!(get_cb(solver).equality_handler, solver)
+_update_penalty_mu!(::AbstractEqualityTreatment, solver) = nothing 
+_update_penalty_mu!(eh::KernelPenaltyEquality, solver) = update_penalty!(eh.schedule, eh, solver)
+update_penalty!(::FixedPenalty, eh, solver) = nothing
+
 function regular!(solver::AbstractMadNLPSolver{T}) where T
     while true
         if (get_cnt(solver).k!=0 && !get_opt(solver).jacobian_constant)
-            eval_jac_wrapper!(solver, get_kkt(solver), get_x(solver))
+            eval_jac_wrapper!(solver, get_kkt(solver), get_x(solver)) # refresh Jacobian at current x
         end
 
-        jtprod!(get_jacl(solver), get_kkt(solver), get_y(solver))
-        sd = get_sd(get_y(solver),get_zl_r(solver),get_zu_r(solver),T(get_opt(solver).s_max))
-        sc = get_sc(get_zl_r(solver),get_zu_r(solver),T(get_opt(solver).s_max))
-        set_inf_pr!(solver, get_inf_pr(get_c(solver)))
+        jtprod!(get_jacl(solver), get_kkt(solver), get_y(solver)) # jacl = J^\top y
+        sd = get_sd(get_y(solver),get_zl_r(solver),get_zu_r(solver),T(get_opt(solver).s_max)) # ipopt scaling factor
+        sc = get_sc(get_zl_r(solver),get_zu_r(solver),T(get_opt(solver).s_max)) # ipopt scaling factor
+        set_inf_pr!(solver, get_inf_pr(get_c(solver))) # primal infeasibility
         set_inf_du!(solver, get_inf_du(
             full(get_f(solver)),
             full(get_zl(solver)),
             full(get_zu(solver)),
             get_jacl(solver),
             sd,
-        ))
-        set_inf_compl!(solver, get_inf_compl(solver, sc; mu=zero(T)))
+        )) # dual infeasibility
+        set_inf_compl!(solver, get_inf_compl(solver, sc; mu=zero(T))) # complementarity for overall problem
 
         print_iter(solver)
 
         # evaluate termination criteria
         @trace(get_logger(solver),"Evaluating termination criteria.")
         !(get_intermediate_callback(solver)(solver, UserCallbackRegular()) :: Bool) && return USER_REQUESTED_STOP
-        get_inf_total(solver) <= get_opt(solver).tol && return SOLVE_SUCCEEDED
+        get_inf_total(solver) <= get_opt(solver).tol && return SOLVE_SUCCEEDED # success
         get_inf_total(solver) <= get_opt(solver).acceptable_tol ?
             (get_cnt(solver).acceptable_cnt < get_opt(solver).acceptable_iter ?
-            get_cnt(solver).acceptable_cnt+=1 : return SOLVED_TO_ACCEPTABLE_LEVEL) : (get_cnt(solver).acceptable_cnt = 0)
-        get_inf_total(solver) >= get_opt(solver).diverging_iterates_tol && return DIVERGING_ITERATES
-        get_cnt(solver).k>=get_opt(solver).max_iter && return MAXIMUM_ITERATIONS_EXCEEDED
-        time()-get_cnt(solver).start_time>=get_opt(solver).max_wall_time && return MAXIMUM_WALLTIME_EXCEEDED
+            get_cnt(solver).acceptable_cnt+=1 : return SOLVED_TO_ACCEPTABLE_LEVEL) : (get_cnt(solver).acceptable_cnt = 0) # if an acceptable tolerance enough times in a row is set, check.
+        get_inf_total(solver) >= get_opt(solver).diverging_iterates_tol && return DIVERGING_ITERATES # diverged if E exceeds some large constant
+        get_cnt(solver).k>=get_opt(solver).max_iter && return MAXIMUM_ITERATIONS_EXCEEDED # max iter
+        time()-get_cnt(solver).start_time>=get_opt(solver).max_wall_time && return MAXIMUM_WALLTIME_EXCEEDED # max time 
 
         # evaluate Hessian
         if (get_cnt(solver).k!=0 && !get_opt(solver).hessian_constant)
@@ -253,6 +261,9 @@ function regular!(solver::AbstractMadNLPSolver{T}) where T
         # update the barrier parameter
         @trace(get_logger(solver),"Updating the barrier parameter.")
         update_barrier!(get_opt(solver).barrier, solver, sc)
+        # update the penalty parameter (uses the just-updated μ_B; no-op unless a
+        # KernelPenaltyEquality handler with a non-fixed schedule is active)
+        update_penalty_mu!(solver)
 
         # factorize the KKT system and solve Newton step
         @trace(get_logger(solver),"Computing the Newton step.")

@@ -105,6 +105,57 @@ constraints only up to a tolerance ``ϵ``.
 struct RelaxEquality <: AbstractEqualityTreatment end
 
 """
+    KernelPenaltyEquality(kernel = QuadraticKernel(); schedule = FixedPenalty(), muP = 1.0)
+
+Treat each equality ``c_E(x) = b`` with a free slack ``s`` (coupling ``c_E(x) - s = b``,
+no barrier on ``s``) and a smooth penalty ``φ(μ, s)`` added to the objective via `kernel`,
+with the penalty parameter ``μ`` advanced by `schedule`. Driving ``μ → ∞`` forces
+``s → 0``, so the equality holds only approximately (governed by ``μ``), like
+[`RelaxEquality`](@ref) — but the penalty Hessian ``D_s = ∂²φ/∂s²`` rides `pr_diag`, so
+this treatment also works on the condensed (SPD/GPU) KKT path.
+
+Pass a constructed instance, e.g.
+`madnlp(nlp; equality_treatment = KernelPenaltyEquality(CoshKernel(); muP = 1.0))`.
+Supported only with `SparseCallback` (`SparseKKTSystem` / `SparseCondensedKKTSystem`).
+"""
+struct KernelPenaltyEquality{T, VT, VI, K<:AbstractEqualityKernel, S<:AbstractPenaltySchedule} <: AbstractEqualityTreatment
+    kernel::K
+    schedule::S
+    muP0::T                  # initial penalty parameter
+    muP::Base.RefValue{T}    # current penalty parameter (mutable; advanced by `schedule`)
+    ind_eqslack::VI          # positions of the equality rows within the slack vector
+    b::VT                    # equality targets, one per equality row (length == length(ind_eqslack))
+end
+
+# User-facing constructor: a *spec* (kernel + schedule + initial μ). The model-sized
+# fields (`ind_eqslack`, `b`) are empty until `create_equality_handler` sizes them.
+function KernelPenaltyEquality(
+    kernel::AbstractEqualityKernel = QuadraticKernel();
+    schedule::AbstractPenaltySchedule = FixedPenalty(), # placeholder for a default strategy TBD
+    muP::Real = 1.0, # placeholder; we expect to start higher.
+)
+    T = typeof(float(muP))
+    return KernelPenaltyEquality(kernel, schedule, T(muP), Ref(T(muP)), Int[], T[])
+end
+
+# Materialize the equality handler against the model. A treatment passed as a *type*
+# (e.g. the default `EnforceEquality`) or as a singleton *instance* passes through; a
+# `KernelPenaltyEquality` *spec* is sized — `ind_eqslack`/`b` are filled from the equality
+# rows (`lcon == ucon`), in the model's array types (GPU-ready).
+create_equality_handler(t::Type{<:AbstractEqualityTreatment}, lcon, ucon) = t()
+create_equality_handler(h::AbstractEqualityTreatment, lcon, ucon) = h
+create_equality_handler(::Type{<:KernelPenaltyEquality}, lcon, ucon) =
+    create_equality_handler(KernelPenaltyEquality(), lcon, ucon)
+function create_equality_handler(spec::KernelPenaltyEquality, lcon, ucon)
+    ind = findall(lcon .== ucon)
+    return KernelPenaltyEquality(spec.kernel, spec.schedule, spec.muP0, Ref(spec.muP0), ind, lcon[ind])
+end
+
+_is_kernel_penalty(::KernelPenaltyEquality) = true
+_is_kernel_penalty(::Type{<:KernelPenaltyEquality}) = true
+_is_kernel_penalty(::Any) = false
+
+"""
     AbstractCallback{T, VT}
 
 Wrap the `AbstractNLPModel` passed by the user in a form amenable to MadNLP.
@@ -366,10 +417,10 @@ function create_sparse_fixed_handler(
     return fixed_handler, n, get_nnzj(nlp.meta), get_nnzh(nlp.meta)
 end
 
-function _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
+function _parse_indexes(lvar, uvar, lcon, ucon, equality_handler)
     m = length(lcon)
     if m > 0
-        if equality_treatment == EnforceEquality
+        if equality_handler isa EnforceEquality
             is_equality = lcon .== ucon
             ind_eq = findall(is_equality)
             ind_ineq = findall(~, is_equality)
@@ -379,6 +430,14 @@ function _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
         end
         xl = [lvar; view(lcon, ind_ineq)]
         xu = [uvar; view(ucon, ind_ineq)]
+        if equality_handler isa KernelPenaltyEquality
+            # Free the penalty equality slacks (no log-barrier): make their bounds ±Inf
+            # *before* ind_lb/ind_ub are computed below, so they are excluded from the
+            # bound-barrier index sets (which are frozen here and never recomputed).
+            nx = length(lvar)
+            @views xl[nx .+ equality_handler.ind_eqslack] .= -Inf
+            @views xu[nx .+ equality_handler.ind_eqslack] .=  Inf
+        end
     else
         ind_eq = similar(lvar, Int, 0)
         ind_ineq = similar(lvar, Int, 0)
@@ -451,7 +510,6 @@ function create_callback(
         hess_J,
         hess_buffer,
     )
-    equality_handler = equality_treatment()
 
     jac_scale = similar(jac_buffer, nnzj)
     fill!(jac_scale, one(T))
@@ -475,7 +533,11 @@ function create_callback(
         uvar = uvar[ind_free]
     end
 
-    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
+    # Materialize the equality handler now that the model bounds are available (a
+    # `KernelPenaltyEquality` spec is sized against the equality rows here).
+    equality_handler = create_equality_handler(equality_treatment, lcon, ucon)
+
+    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_handler)
 
     return SparseCallback(
         nlp,
@@ -525,8 +587,11 @@ function create_callback(
     con_scale = similar(x0, m)
     fill!(con_scale, one(T))
 
+    _is_kernel_penalty(equality_treatment) && error(
+        "KernelPenaltyEquality is only supported with SparseCallback " *
+        "(SparseKKTSystem / SparseCondensedKKTSystem), not the dense callback."
+    )
     fixed_handler = create_dense_fixed_handler(fixed_variable_treatment, nlp)
-    equality_handler = equality_treatment()
 
     # Get indexing
     lvar = get_lvar(nlp)
@@ -534,7 +599,8 @@ function create_callback(
     lcon = get_lcon(nlp)
     ucon = get_ucon(nlp)
 
-    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
+    equality_handler = create_equality_handler(equality_treatment, lcon, ucon)
+    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_handler)
 
     # Get fixed variables
     ind_fixed = findall(lvar .== uvar)
@@ -575,6 +641,24 @@ end
 function _treat_equality_initialize!(equality_handler::EnforceEquality, lcon, ucon, tol) end
 function _treat_equality_initialize!(equality_handler::RelaxEquality, lcon, ucon, tol)
     return set_initial_bounds!(lcon, ucon, tol)
+end
+# Penalty equalities: keep the lcon/ucon copies intact (so `rhs .= (lcon.==ucon).*lcon`
+# still recovers `b`); all penalty-specific init is centralized in
+# `_finalize_penalty_initialize!`, run at the end of `initialize!`.
+function _treat_equality_initialize!(equality_handler::KernelPenaltyEquality, lcon, ucon, tol) end
+
+# Override the generic slack init for penalty equality rows: free their bounds (no
+# barrier — matching the ind_lb/ind_ub exclusion), keep the equality target `rhs = b`, and
+# start the slack at `s = c(x0) - b` so the coupling `c(x) - s = b` holds at the first
+# iterate. No-op for every other treatment.
+_finalize_penalty_initialize!(::AbstractEqualityTreatment, xl, xu, rhs, x, con_buffer) = nothing
+function _finalize_penalty_initialize!(eh::KernelPenaltyEquality{T}, xl, xu, rhs, x, con_buffer) where {T}
+    es = eh.ind_eqslack
+    @views slack(xl)[es] .= -T(Inf)
+    @views slack(xu)[es] .=  T(Inf)
+    @views rhs[es]       .= eh.b
+    @views slack(x)[es]  .= view(con_buffer, es) .- eh.b
+    return
 end
 # Initiate fixed variables. By default, do nothing.
 function _treat_fixed_variable_initialize!(cb::AbstractCallback, x0, lvar, uvar) end
@@ -632,6 +716,8 @@ function initialize!(
 
     set_initial_bounds!(slack(xl), slack(xu), tol)
     initialize_variables!(slack(x), slack(xl), slack(xu), bound_push, bound_fac)
+
+    _finalize_penalty_initialize!(cb.equality_handler, xl, xu, rhs, x, con_buffer)
     return
 end
 
