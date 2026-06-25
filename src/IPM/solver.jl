@@ -257,7 +257,7 @@ function update_penalty!(sched::StaticContinuation, eh::KernelPenaltyEquality, s
         E_opt   = get_inf_barrier(solver)                                    # subproblem optimality error
         s_inf   = norm(view(slack(get_x(solver)), eh.ind_eqslack), Inf)      # ‖s_E‖∞ (GPU-safe)
         opt_tol = T(sched.opt_tol_coef) * μ^T(sched.opt_tol_exp)             # ε_P(μ_P)
-        if E_opt <= opt_tol && s_inf <= T(sched.s_thresh)
+        if E_opt <= opt_tol && s_inf <= T(sched.s_thresh) / μ                # gate scaled by 1/μ_P ⇒ μ_P·s ≲ s_thresh
             eh.muP[] = min(T(sched.muP_max), max(T(sched.kappa_P) * μ, μ^T(sched.theta_P)))
             sched.n_bumps[] += 1
         end

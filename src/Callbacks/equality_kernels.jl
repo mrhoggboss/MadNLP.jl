@@ -85,7 +85,7 @@ struct FixedPenalty <: AbstractPenaltySchedule end
 # `src/IPM/solver.jl` next to the solver-loop hook so `solver` accessors are in scope.
 
 """
-    StaticContinuation(; kappa_P, theta_P, s_thresh, opt_tol_coef = 1.0, opt_tol_exp = -1.0, muP_max = Inf)
+    StaticContinuation(; kappa_P, theta_P, s_thresh = 1.0, opt_tol_coef = 1.0, opt_tol_exp = -1.0, muP_max = Inf)
         <: AbstractPenaltySchedule
 
 Static (fixed-parameter) μ_P continuation, gated on the subproblem (decoupled from μ_B). Once per
@@ -96,8 +96,9 @@ iteration, bump `μ_P` **iff both** gates hold:
      The default `opt_tol_coef = 1, opt_tol_exp = -1` gives `ε_P(μ_P) = 1/μ_P`. Here
      `get_inf_barrier = max(inf_pr, inf_du, inf_compl_mu)`; `inf_du` already includes the penalty
      stationarity φ'(s) − y, so this is the *penalty*-barrier subproblem error.
-  2. the equality-slack ∞-norm is small enough to keep the cosh argument well-conditioned:
-         `‖s_E‖∞ ≤ s_thresh`   (μ_P·s is the cosh argument in `kernel_hess = μ_P²·cosh(μ_P·s)`).
+  2. the equality-slack ∞-norm, scaled by 1/μ_P, is small enough to keep the cosh argument bounded:
+         `‖s_E‖∞ ≤ s_thresh / μ_P`   (so μ_P·‖s_E‖∞ ≤ s_thresh — the cosh argument μ_P·s in
+         `kernel_hess = μ_P²·cosh(μ_P·s)` stays ≲ s_thresh right after the bump). Default `s_thresh = 1`.
 
 The bump is the Ipopt-style superlinear step, capped:
 
@@ -113,19 +114,19 @@ solve), updated in place each iteration; construct a fresh schedule per solve to
 `update_penalty!(::StaticContinuation, handler, solver)` is defined in `src/IPM/solver.jl`.
 
 Pass it to the treatment, e.g.
-`KernelPenaltyEquality(CoshKernel(); schedule = StaticContinuation(kappa_P=10.0, theta_P=1.5, s_thresh=1e-2), muP=1.0)`.
+`KernelPenaltyEquality(CoshKernel(); schedule = StaticContinuation(kappa_P=10.0, theta_P=1.5), muP=1.0)`.
 """
 struct StaticContinuation <: AbstractPenaltySchedule
     kappa_P::Float64        # geometric growth factor κ_P (>1)
     theta_P::Float64        # superlinear growth exponent θ_P (>1)
     opt_tol_coef::Float64   # c in ε_P(μ_P) = c·μ_P^p  (optimality-error gate; default 1)
     opt_tol_exp::Float64    # p in ε_P(μ_P) = c·μ_P^p  (default -1 ⇒ ε_P = 1/μ_P)
-    s_thresh::Float64       # τ_s : equality-slack ∞-norm gate (conditioning)
+    s_thresh::Float64       # τ_s : gate ‖s_E‖∞ ≤ s_thresh/μ_P (bounds cosh arg μ_P·s ≲ s_thresh); default 1
     muP_max::Float64        # hard cap on μ_P (Inf = uncapped)
     n_bumps::Base.RefValue{Int}      # diagnostic: # of μ_P bumps this solve
     muP_cur::Base.RefValue{Float64}  # diagnostic: current μ_P (→ final μ_P after the solve)
 end
-StaticContinuation(; kappa_P::Real, theta_P::Real, s_thresh::Real,
+StaticContinuation(; kappa_P::Real, theta_P::Real, s_thresh::Real = 1.0,
                    opt_tol_coef::Real = 1.0, opt_tol_exp::Real = -1.0, muP_max::Real = Inf) =
     StaticContinuation(Float64(kappa_P), Float64(theta_P), Float64(opt_tol_coef),
                        Float64(opt_tol_exp), Float64(s_thresh), Float64(muP_max), Ref(0), Ref(NaN))

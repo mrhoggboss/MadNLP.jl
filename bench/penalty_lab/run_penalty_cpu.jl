@@ -28,7 +28,7 @@ const CFG = (
     theta_P  = 1.5,     # θ_P  superlinear exponent  (>1)            [PLACEHOLDER]
     c_opt    = 1.0,     # ε_P(μ_P) = c_opt · μ_P^p_opt = 1/μ_P by default (opt-error gate)
     p_opt    = -1.0,    #   default ε_P = 1/μ_P  (c_opt=1, p_opt=-1)
-    s_thresh = 1.0e-2,  # τ_s  equality-slack ∞-norm gate (conditioning) [PLACEHOLDER]
+    s_thresh = 1.0,     # τ_s  gate ‖s_E‖∞ ≤ s_thresh/μ_P (bounds cosh arg μ_P·s ≲ s_thresh)
     muP0     = 1.0,     # initial μ_P                                 [PLACEHOLDER]
     muP_max  = 1.0e12,  # hard cap on μ_P                            [PLACEHOLDER]
     tol      = 1.0e-8,  # baseline-matched (condensed system)

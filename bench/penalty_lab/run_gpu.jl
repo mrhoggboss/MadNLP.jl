@@ -49,7 +49,7 @@ cfg(name, prob, sys; kernel = QuadraticKernel(), schedule = FixedPenalty(), muP 
 P = exa(50)
 CONFIGS = [
     cfg("exa_con_fixed_1e3", P, CON_GPU; muP = 1e3),
-    cfg("exa_con_static_r1", P, CON_GPU; schedule = StaticContinuation(kappa_P = 10.0, theta_P = 1.5, s_thresh = 1e-2, muP_max = 1e6)),
+    cfg("exa_con_static_r1", P, CON_GPU; schedule = StaticContinuation(kappa_P = 10.0, theta_P = 1.5, muP_max = 1e6)),
 ]
 # ================================================================================
 
