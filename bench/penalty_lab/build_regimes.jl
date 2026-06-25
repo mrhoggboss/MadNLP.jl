@@ -5,15 +5,16 @@
 # Run:  julia --project=bench/penalty bench/penalty_lab/build_regimes.jl
 #
 # Universe: CUTEst problems with nvar >= ncon (ncon = number of general linear+nonlinear
-# constraints; variable bounds are NOT counted). Four nested regimes by nvar cap.
-# Buckets (mutually exclusive): unconstrained | bound_only | equality_only | inequality_only | mixed.
+# constraints; variable bounds are NOT counted), EXCLUDING truly-unconstrained problems
+# (ncon==0 AND no variable bounds/fixed vars — never tested). Four nested regimes by nvar cap.
+# Buckets (mutually exclusive): bound_only | equality_only | inequality_only | mixed.
 
 using CUTEst, JSON
 
 const CLASSF  = joinpath(pkgdir(CUTEst), "src", "classf.json")
 const OUTDIR  = joinpath(@__DIR__, "regimes")
 const REGIMES = [("le100", 100.0), ("le500", 500.0), ("le5000", 5000.0), ("full", Inf)]
-const BUCKETS = ["unconstrained", "bound_only", "equality_only", "inequality_only", "mixed"]
+const BUCKETS = ["bound_only", "equality_only", "inequality_only", "mixed"]  # unconstrained excluded
 const OBJTYPES = ["none", "constant", "linear", "quadratic", "sum_of_squares", "other"]
 mkpath(OUTDIR)
 
@@ -39,8 +40,12 @@ bucket(m) =
     m["n_eq"]  == 0 ? "inequality_only" : "mixed"
 
 allm     = [meta(p) for p in keys(data)]
-universe = sort([m for m in allm if m["nvar"] >= m["ncon"]], by = m -> (m["nvar"], m["p"]))
-println("CUTEst classf.json: $(length(data)) problems; $(length(universe)) with nvar>=ncon\n")
+# universe: nvar >= ncon AND not truly-unconstrained (must have a general constraint OR a bound/fixed var)
+universe = sort([m for m in allm if m["nvar"] >= m["ncon"] && (m["ncon"] > 0 || m["has_bounds"])],
+                by = m -> (m["nvar"], m["p"]))
+n_uncon = count(m -> m["nvar"] >= m["ncon"] && m["ncon"] == 0 && !m["has_bounds"], allm)
+println("CUTEst classf.json: $(length(data)) problems; $(length(universe)) with nvar>=ncon ",
+        "(excluded $n_uncon truly-unconstrained)\n")
 
 regime_problems(cap) = [m for m in universe if m["nvar"] <= cap]
 out = Dict{String,Any}()

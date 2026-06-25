@@ -1,8 +1,9 @@
 # Loader for the precomputed CUTEst size regimes (see bench/penalty_lab/regimes/).
 # Regimes are the CUTEst problems with nvar >= ncon (ncon = general linear+nonlinear
-# constraints, NOT variable bounds), split by a nvar cap: :le100, :le500, :le5000, :full
-# (nested). `<regime>.txt` = all problems; `<regime>_eq.txt` = the equality-bearing subset
-# (equality_only + mixed) — the set that actually exercises the equality penalty.
+# constraints, NOT variable bounds), EXCLUDING truly-unconstrained problems (ncon==0 and
+# no bounds), split by a nvar cap: :le100, :le500, :le5000, :full (nested).
+# `<regime>.txt` = all problems in the regime; `<regime>_eq.txt` = the equality-bearing
+# subset (equality_only + mixed) — the set that actually exercises the equality penalty.
 # Built from CUTEst 1.4.0 classf.json by build_regimes.jl.
 
 const REGIME_DIR = joinpath(@__DIR__, "regimes")
