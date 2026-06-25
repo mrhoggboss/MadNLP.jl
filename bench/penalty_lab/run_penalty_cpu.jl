@@ -78,6 +78,7 @@ addprocs(NW; exeflags = "--project=$(PROJ)")
         try
             nvar, ncon = nlp.meta.nvar, nlp.meta.ncon
             t = @elapsed r = madnlp(nlp; kkt_system=MadNLP.SparseCondensedKKTSystem, tol=cfg.tol,
+                                    acceptable_tol=cfg.tol,   # disable ACCEPTABLE exit (=tol ⇒ acceptable_cnt stays 0)
                                     equality_treatment=treat, max_wall_time=MAXWALL, print_level=MadNLP.ERROR)
             return (name=name, nvar=nvar, ncon=ncon, status=string(r.status), iter=r.iter,
                     nfact=r.counters.factorization_cnt, time=t, eqfeas=_eqfeas(nlp, r.solution),
