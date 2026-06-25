@@ -649,15 +649,17 @@ function _treat_equality_initialize!(equality_handler::KernelPenaltyEquality, lc
 
 # Override the generic slack init for penalty equality rows: free their bounds (no
 # barrier — matching the ind_lb/ind_ub exclusion), keep the equality target `rhs = b`, and
-# start the slack at `s = c(x0) - b` so the coupling `c(x) - s = b` holds at the first
-# iterate. No-op for every other treatment.
+# start the slack at `s = 0` so the cosh argument `μ_P·s` is exactly 0 at the first iterate
+# (no overflow, zero penalty gradient, regardless of μ_P or the initial residual). The initial
+# equality residual `c(x0) - b` then enters as primal infeasibility (inf_pr) — the ordinary
+# infeasible-start situation — instead of being loaded into the penalty. No-op for other treatments.
 _finalize_penalty_initialize!(::AbstractEqualityTreatment, xl, xu, rhs, x, con_buffer) = nothing
 function _finalize_penalty_initialize!(eh::KernelPenaltyEquality{T}, xl, xu, rhs, x, con_buffer) where {T}
     es = eh.ind_eqslack
     @views slack(xl)[es] .= -T(Inf)
     @views slack(xu)[es] .=  T(Inf)
     @views rhs[es]       .= eh.b
-    @views slack(x)[es]  .= view(con_buffer, es) .- eh.b
+    @views slack(x)[es]  .= zero(T)            # s = 0 (was c(x0)-b); keeps μ_P·s = 0 at start
     return
 end
 # Initiate fixed variables. By default, do nothing.
