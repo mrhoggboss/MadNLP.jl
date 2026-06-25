@@ -9,18 +9,26 @@
 # Run:  julia --project=bench/penalty bench/penalty/fd_gate_native.jl
 
 import Pkg; Pkg.activate(@__DIR__; io = devnull)
-using MadNLP, MadNLPHSL, CUTEst, NLPModels, LinearAlgebra, Printf
+using MadNLP, MadNLPHSL, CUTEst, NLPModels, LinearAlgebra, Printf, Random
 
-const LINEAR_SOLVER = Ma27Solver               # swap to a cuDSS solver on the GPU path later
-const KKT_SYSTEM    = MadNLP.SparseKKTSystem    # swap to SparseCondensedKKTSystem later
+const LINEAR_SOLVER = Ma27Solver               # augmented-path solver for the KKT-agnostic demos
+const KKT_SYSTEM    = MadNLP.SparseKKTSystem
+
+# FD-gate KKT configs: (label, kkt_system, linear_solver). The condensed/CHOLMOD path is SPD,
+# and CHOLMOD is a Cholesky solver — so factorizing it at all *proves* the condensed matrix is
+# SPD (the inertia claim). The condensed path is the cuDSS-GPU path in a later stage.
+const CONFIGS = [
+    (label = "augmented/MA27",    kkt = MadNLP.SparseKKTSystem,          ls = Ma27Solver),
+    (label = "condensed/CHOLMOD", kkt = MadNLP.SparseCondensedKKTSystem, ls = MadNLP.CHOLMODSolver),
+]
 
 # Build a solver with the penalty treatment and initialize it (no solve), for white-box
 # inspection of the assembled quantities.
-function build_solver(nlp; muP, kernel = QuadraticKernel())
+function build_solver(nlp; muP, kkt = KKT_SYSTEM, ls = LINEAR_SOLVER, kernel = QuadraticKernel())
     solver = MadNLP.MadNLPSolver(nlp;
         equality_treatment = KernelPenaltyEquality(kernel; muP = muP),
-        linear_solver = LINEAR_SOLVER,
-        kkt_system    = KKT_SYSTEM,
+        linear_solver = ls,
+        kkt_system    = kkt,
         nlp_scaling   = false,          # remove the scaling-units confound for the FD gate
         print_level   = MadNLP.ERROR,
     )
@@ -59,27 +67,29 @@ function check_objective(solver)
     return abs((total - base) - pen_expected) / (abs(pen_expected) + 1e-30)
 end
 
-# gradient: central FD of total objective wrt each eq slack == slack(f)[es] (= φ'); and all
-# non-eq slack entries of f are zero.
-function check_gradient(solver; ε = 1e-6)
+# gradient: directional central FD of the total objective over the eq slacks, along one
+# fixed pseudo-random direction d, vs dot(slack(f)[es], d) (slack(f) = φ'). Also checks all
+# non-eq slack entries of f are zero. The directional form needs only O(1) eval_f calls (not
+# O(m_eq)) and normalizes by the aggregate derivative, so it stays accurate at THRESH=1e-8 on
+# large / many-equality problems (no per-component tiny-denominator blowup, less cancellation).
+# ε is large because the QuadraticKernel has zero central-FD truncation error, so a bigger step
+# only reduces roundoff against the (possibly large) total objective.
+function check_gradient(solver; ε = 1e-3, seed = 1)
     cb = MadNLP.get_cb(solver); eh = cb.equality_handler
     x = MadNLP.get_x(solver); f = MadNLP.get_f(solver)
     es = eh.ind_eqslack
     MadNLP.eval_grad_f_wrapper!(solver, f, x)
     sf = MadNLP.slack(f); s = MadNLP.slack(x)
-    isempty(es) && return (0.0, all(sf .== 0))
-    others = setdiff(1:length(sf), es)
-    ok_other = all(sf[others] .== 0)
-    rel = 0.0
-    for i in es
-        s0 = s[i]
-        s[i] = s0 + ε; fp = MadNLP.eval_f_wrapper(solver, x)
-        s[i] = s0 - ε; fm = MadNLP.eval_f_wrapper(solver, x)
-        s[i] = s0
-        fd = (fp - fm) / (2ε)
-        rel = max(rel, abs(fd - sf[i]) / (abs(sf[i]) + 1e-30))
-    end
-    return (rel, ok_other)
+    isempty(es) && return (0.0, all(iszero, sf))
+    ok_other = all(iszero, @view sf[setdiff(1:length(sf), es)])
+    d  = randn(Random.MersenneTwister(seed), length(es))
+    s0 = copy(@view s[es])
+    @views s[es] .= s0 .+ ε .* d; fp = MadNLP.eval_f_wrapper(solver, x)
+    @views s[es] .= s0 .- ε .* d; fm = MadNLP.eval_f_wrapper(solver, x)
+    @views s[es] .= s0
+    fd  = (fp - fm) / (2ε)
+    ana = dot(@view(sf[es]), d)
+    return (abs(fd - ana) / (abs(ana) + 1e-30), ok_other)
 end
 
 # assembled diagonal: pr_diag[n+es] == reg + D_s(μ, s_eq)
@@ -93,6 +103,20 @@ function check_diagonal(solver)
     s = MadNLP.slack(x)
     expected = [reg + MadNLP.kernel_hess(eh.kernel, μ, s[i]) for i in es]
     return norm(kkt.pr_diag[n .+ es] .- expected, Inf)
+end
+
+# Set the equality slacks to a non-degenerate O(1) point. The initial iterate may be exactly
+# feasible (penalty ≈ 0, e.g. DIXCHLNG/ELEC) or wildly infeasible (penalty ~1e16, e.g.
+# CATENARY); either makes the *relative* objective/gradient checks roundoff-dominated.
+# Evaluating the penalty machinery at a clean O(1) slack point makes the checks meaningful.
+# Call AFTER check_structure, which needs the pristine initial coupling residual.
+function set_test_slacks!(solver)
+    eh = MadNLP.get_cb(solver).equality_handler
+    eh isa KernelPenaltyEquality || return
+    es = eh.ind_eqslack; isempty(es) && return
+    s = MadNLP.slack(MadNLP.get_x(solver))
+    @views s[es] .= 0.2 .+ 0.6 .* (1:length(es)) ./ length(es)   # spread over (0.2, 0.8]
+    return
 end
 
 # ---- end-to-end equality feasibility -------------------------------------------------
@@ -109,21 +133,42 @@ function eq_feas(nlp, x)
 end
 
 # ============================ run ============================
-const FD_PROBS  = ["HS6", "HS7", "HS8", "HS9", "HS28", "HS48", "HS52", "HS14"]
-const THRESH    = 1e-6
+# Spanning constraint types {eq, eq+bounds, eq+ineq+bounds, none} × objective convexity
+# {linear, convex quadratic, general convex, nonconvex} × size (2 → 10000 vars). Only mE>0
+# problems exercise the penalty; the no-equality ones verify it cleanly no-ops.
+const FD_PROBS = [
+    # ── nonconvex objective ──
+    "HS6", "HS7", "HS8", "HS9", "HS40", "HS56", "HS78",     # eq only (nonlinear eq), small
+    "DIXCHLNG", "ORTHREGB", "MSS1", "ELEC", "LUKVLE3",      # eq only, medium → large (10000)
+    "HS60", "HS63", "HS107", "HS119", "CATENARY", "DTOC2",  # eq + bounds, small → large
+    "HS14", "HS71", "HS114",                                # eq + inequality + bounds (mixed)
+    # ── convex quadratic objective ──
+    "HS28", "HS52", "GENHS28",                              # eq only (linear eq)
+    "HS53", "DUAL1",                                        # eq + bounds (DUAL1: 85 vars)
+    # ── general convex objective (log / entropy) ──
+    "HS111", "HS112",                                       # eq + bounds
+    # ── linear objective ──
+    "EXTRASIM",                                             # eq + bound
+    # ── no equalities → penalty must cleanly no-op (mE = 0) ──
+    "HS21", "HS118", "AVGASB",                              # convex-quad / linear obj, ineq + bounds
+]
+# CPU accuracy target (matches the solver tol we run at). Stage 4 (GPU/cuDSS) should validate
+# at 1e-6 instead.
+const THRESH    = 1e-8
 
-println("=== Stage-1 FD GATE: native KernelPenaltyEquality (QuadraticKernel) ===")
-println("linear_solver=$(LINEAR_SOLVER)  kkt_system=$(KKT_SYSTEM)\n")
-function run_fd_gate()
+println("=== FD GATE: native KernelPenaltyEquality (QuadraticKernel), per KKT config ===\n")
+function run_fd_gate(cfg)
+    @printf("[%s]\n", cfg.label)
     @printf("%-7s %5s %5s | %-7s %-9s %-9s %-9s %-6s\n",
             "prob", "n", "mE", "struct", "obj", "grad", "diag", "g0?")
     fd_ok = true
     for p in FD_PROBS
         nlp = CUTEstModel(p; decode = true)
         try
-            solver = build_solver(nlp; muP = 50.0)
+            solver = build_solver(nlp; muP = 50.0, kkt = cfg.kkt, ls = cfg.ls)
             eh = MadNLP.get_cb(solver).equality_handler
-            st  = check_structure(solver)
+            st  = check_structure(solver)      # pristine initial point (coupling residual, bounds)
+            set_test_slacks!(solver)           # then move eq-slacks to an O(1) point
             ov  = check_objective(solver)
             (gr, g0) = check_gradient(solver)
             dg  = check_diagonal(solver)
@@ -141,8 +186,15 @@ function run_fd_gate()
     end
     return fd_ok
 end
-fd_ok = run_fd_gate()
-println(fd_ok ? "\nFD_GATE_PASS" : "\nFD_GATE_FAIL")
+function run_all_fd_gates()
+    ok = true
+    for cfg in CONFIGS
+        ok &= run_fd_gate(cfg); println()
+    end
+    return ok
+end
+fd_ok = run_all_fd_gates()
+println(fd_ok ? "FD_GATE_PASS" : "FD_GATE_FAIL")
 
 # end-to-end: HS14 equality feasibility should fall ~1/μ (quadratic penalty) and the
 # objective should approach the exact EnforceEquality solution as μ grows.
@@ -224,6 +276,30 @@ let
         @printf("Decoupled StepEveryK (∌μ_B): %-26s iters=%d  eqfeas=%.2e  %s\n",
                 rdk.status, rdk.iter, eq_feas(nlp, rdk.solution[1:get_nvar(nlp)]),
                 ok ? "(decoupled schedule converged — OK)" : "<-- EXPECTED CONVERGENCE")
+    finally
+        finalize(nlp)
+    end
+end
+
+# ---- Stage 3: condensed (SPD) KKT path -----------------------------------------------
+# The penalty D_s rides pr_diag → build_kkt!'s diag_buffer with NO new injection code, so the
+# treatment also works on SparseCondensedKKTSystem. CHOLMOD (Cholesky) factorizing it proves
+# the condensed matrix is SPD. This is the cuDSS-GPU path in the next stage.
+println("\n=== Stage 3: condensed KKT path (continuation), per config ===")
+let
+    nlp = CUTEstModel("HS14"; decode = true)
+    try
+        for cfg in CONFIGS
+            r = madnlp(nlp; equality_treatment = KernelPenaltyEquality(QuadraticKernel();
+                       schedule = StaticContinuation(rho = 1.0, muP_max = 1e6), muP = 1.0),
+                       kkt_system = cfg.kkt, linear_solver = cfg.ls,
+                       nlp_scaling = false, print_level = MadNLP.ERROR)
+            ok = r.status in (MadNLP.SOLVE_SUCCEEDED, MadNLP.SOLVED_TO_ACCEPTABLE_LEVEL)
+            @printf("%-18s : %-26s iters=%d eqfeas=%.2e obj=% .6e %s\n",
+                    cfg.label, r.status, r.iter, eq_feas(nlp, r.solution[1:get_nvar(nlp)]),
+                    obj(nlp, r.solution[1:get_nvar(nlp)]),
+                    ok ? "" : "<-- EXPECTED CONVERGENCE")
+        end
     finally
         finalize(nlp)
     end
