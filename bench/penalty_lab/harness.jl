@@ -64,10 +64,12 @@ function (rec::Recorder)(solver, mode)
 end
 
 # ---- equality feasibility ‖c_E(x) - b‖∞ at the returned point (host or device x) -----
+# NLPModels accessors are NLPModels.-qualified so the harness works whether the driver also
+# `using`s CUTEst or ExaModels (both export clashing names like get_lcon).
 function eqfeas(nlp, x)
-    m = get_ncon(nlp); m == 0 && return 0.0
-    c = similar(x, m); cons!(nlp, x, c)
-    lc = get_lcon(nlp); uc = get_ucon(nlp)
+    m = NLPModels.get_ncon(nlp); m == 0 && return 0.0
+    c = similar(x, m); NLPModels.cons!(nlp, x, c)
+    lc = NLPModels.get_lcon(nlp); uc = NLPModels.get_ucon(nlp)
     return Float64(maximum(abs.(c .- lc) .* (lc .== uc)))
 end
 
@@ -107,7 +109,7 @@ function run_config(cfg)
         )
         x = r.solution
         return RunResult(cfg.name, r.status, r.iter, r.counters.factorization_cnt,
-                         t, eqfeas(nlp, x), Float64(obj(nlp, x)), rec)
+                         t, eqfeas(nlp, x), Float64(NLPModels.obj(nlp, x)), rec)
     finally
         cleanup(nlp)
     end

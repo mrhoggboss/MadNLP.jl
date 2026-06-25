@@ -22,8 +22,9 @@ end
 penalty_objective(::AbstractEqualityTreatment, s) = zero(eltype(s))
 function penalty_objective(eh::KernelPenaltyEquality, s)
     μ = eh.muP[]
-    se = view(s, eh.ind_eqslack)
-    return mapreduce(si -> kernel_val(eh.kernel, μ, si), +, se; init = zero(eltype(s)))
+    kernel = eh.kernel        # bind the singleton kernel locally: the mapreduce closure must
+    se = view(s, eh.ind_eqslack)   # capture only bitstype values (kernel, μ) — NOT the handler
+    return mapreduce(si -> kernel_val(kernel, μ, si), +, se; init = zero(eltype(s)))   # (eh holds GPU arrays)
 end
 
 # Checked version used by eval_f_wrapper: terminate the solve if the penalty overflowed.
