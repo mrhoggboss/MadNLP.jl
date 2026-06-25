@@ -5,7 +5,7 @@
 #
 # WHERE A STRATEGY ENTERS THE SOLVER (exact code locations):
 #   • abstract type / shipped strategies .... src/Callbacks/equality_kernels.jl:76 (abstract),
-#       :83 (FixedPenalty), :108 (StaticContinuation)
+#       FixedPenalty, StaticContinuation (subproblem-gated μ_P continuation)
 #   • the handler carries the strategy ....... src/Callbacks/nlpmodels.jl:123 (field `schedule`)
 #   • per-iteration hook in regular! ......... src/IPM/solver.jl:303  update_penalty_mu!(solver)
 #       called right after update_barrier! (:300), before set_aug_diagonal! (:307)
@@ -28,11 +28,13 @@
 
 using MadNLP, LinearAlgebra
 
-# FixedPenalty and StaticContinuation(; rho, muP_max) ship in MadNLP (exported). Add more below.
+# FixedPenalty and StaticContinuation(; kappa_P, theta_P, s_thresh, …) ship in MadNLP (exported).
+# (StaticContinuation is the subproblem-gated μ_P continuation; bumps μ_P when get_inf_barrier ≤
+#  ε_P(μ_P) and ‖s_E‖∞ ≤ s_thresh.) Add more strategies below.
 
 # ── EXAMPLE TEMPLATE 1: power law in μ_B with a hard floor (decoupled-capable variant) ──
-# μ_P = clamp( muP0 * (muB0/μ_B)^rho , muP0 , muP_max ). Same family as StaticContinuation
-# but kept here as an editable template for quick parameter studies.
+# μ_P = clamp( muP0 * (muB0/μ_B)^rho , muP0 , muP_max ). This is the μ_B-tracking continuation
+# (the *previous* StaticContinuation); kept here as an editable template for parameter studies.
 struct PowerLawMuB <: MadNLP.AbstractPenaltySchedule
     rho::Float64
     muP_max::Float64

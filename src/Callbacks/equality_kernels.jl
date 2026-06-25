@@ -85,30 +85,47 @@ struct FixedPenalty <: AbstractPenaltySchedule end
 # `src/IPM/solver.jl` next to the solver-loop hook so `solver` accessors are in scope.
 
 """
-    StaticContinuation(; rho = 1.0, muP_max = Inf) <: AbstractPenaltySchedule
+    StaticContinuation(; kappa_P, theta_P, s_thresh, opt_tol_coef = 1.0, opt_tol_exp = -1.0, muP_max = Inf)
+        <: AbstractPenaltySchedule
 
-Default continuation schedule. Ties the penalty parameter `μ_P` to the barrier parameter
-`μ_B` (its own choice — the solver framework does not assume `μ_P` depends on `μ_B`):
+Static (fixed-parameter) μ_P continuation, gated on the subproblem (decoupled from μ_B). Once per
+iteration, bump `μ_P` **iff both** gates hold:
 
-    μ_P = min(muP_max, muP0 * (mu_init / μ_B)^rho)
+  1. the penalty-barrier subproblem optimality error is small enough:
+         `get_inf_barrier(solver) ≤ ε_P(μ_P)`,  with  `ε_P(μ_P) = opt_tol_coef · μ_P^opt_tol_exp`.
+     The default `opt_tol_coef = 1, opt_tol_exp = -1` gives `ε_P(μ_P) = 1/μ_P`. Here
+     `get_inf_barrier = max(inf_pr, inf_du, inf_compl_mu)`; `inf_du` already includes the penalty
+     stationarity φ'(s) − y, so this is the *penalty*-barrier subproblem error.
+  2. the equality-slack ∞-norm is small enough to keep the cosh argument well-conditioned:
+         `‖s_E‖∞ ≤ s_thresh`   (μ_P·s is the cosh argument in `kernel_hess = μ_P²·cosh(μ_P·s)`).
 
-`muP0` is read from the handler and `mu_init` from the barrier, so the schedule carries no
-per-solve state (the current `μ_P` lives in the handler's `Ref`, re-materialized each solve).
-Because `μ_B` is piecewise-constant (it only changes when the barrier tightens), `μ_P` moves
-only on iterations where `μ_B` already moved — so this schedule adds no extra filter resets.
+The bump is the Ipopt-style superlinear step, capped:
 
-There is NO overflow safeguard: the schedule is the only thing controlling `μ_P`. With a steep
-kernel ([`CoshKernel`](@ref)) an aggressive `rho`/`muP_max` can drive `μ_P·s` past the overflow
-threshold, which terminates the solve with an `InvalidNumberException` — that is intentional
-feedback; tune `rho`/`muP_max` down.
+    μ_P ← min(muP_max, max(kappa_P·μ_P, μ_P^theta_P))
+
+`kappa_P > 1` (geometric) and `theta_P > 1` (superlinear; dominates once μ_P > 1). The framework
+(`_update_penalty_mu!`) resets the filter and re-caches φ'(s)/the merit baseline whenever μ_P moves.
+No overflow safeguard — if a bump drives μ_P·s past the cosh overflow threshold the solve
+terminates with `InvalidNumberException` (signal to soften the gates / cap).
+
+`n_bumps` and `muP_cur` are diagnostic refs (bump count and current μ_P, → final μ_P after the
+solve), updated in place each iteration; construct a fresh schedule per solve to read them.
+`update_penalty!(::StaticContinuation, handler, solver)` is defined in `src/IPM/solver.jl`.
 
 Pass it to the treatment, e.g.
-`KernelPenaltyEquality(CoshKernel(); schedule = StaticContinuation(rho=0.85, muP_max=1e4), muP=1.0)`.
+`KernelPenaltyEquality(CoshKernel(); schedule = StaticContinuation(kappa_P=10.0, theta_P=1.5, s_thresh=1e-2), muP=1.0)`.
 """
 struct StaticContinuation <: AbstractPenaltySchedule
-    rho::Float64       # continuation exponent (μ_P ∝ μ_B^{-rho})
-    muP_max::Float64   # hard cap on μ_P (Inf = uncapped)
+    kappa_P::Float64        # geometric growth factor κ_P (>1)
+    theta_P::Float64        # superlinear growth exponent θ_P (>1)
+    opt_tol_coef::Float64   # c in ε_P(μ_P) = c·μ_P^p  (optimality-error gate; default 1)
+    opt_tol_exp::Float64    # p in ε_P(μ_P) = c·μ_P^p  (default -1 ⇒ ε_P = 1/μ_P)
+    s_thresh::Float64       # τ_s : equality-slack ∞-norm gate (conditioning)
+    muP_max::Float64        # hard cap on μ_P (Inf = uncapped)
+    n_bumps::Base.RefValue{Int}      # diagnostic: # of μ_P bumps this solve
+    muP_cur::Base.RefValue{Float64}  # diagnostic: current μ_P (→ final μ_P after the solve)
 end
-StaticContinuation(; rho::Real = 1.0, muP_max::Real = Inf) =
-    StaticContinuation(Float64(rho), Float64(muP_max))
-# `update_penalty!(::StaticContinuation, handler, solver)` is defined in `src/IPM/solver.jl`.
+StaticContinuation(; kappa_P::Real, theta_P::Real, s_thresh::Real,
+                   opt_tol_coef::Real = 1.0, opt_tol_exp::Real = -1.0, muP_max::Real = Inf) =
+    StaticContinuation(Float64(kappa_P), Float64(theta_P), Float64(opt_tol_coef),
+                       Float64(opt_tol_exp), Float64(s_thresh), Float64(muP_max), Ref(0), Ref(NaN))

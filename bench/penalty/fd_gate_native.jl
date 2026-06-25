@@ -265,7 +265,7 @@ let
                       linear_solver = LINEAR_SOLVER, nlp_scaling = false, print_level = MadNLP.ERROR)
         @printf("Quad fixed μ=1e6           : %-26s iters=%d\n", rfix.status, rfix.iter)
         rsc = madnlp(nlp; equality_treatment = KernelPenaltyEquality(QuadraticKernel();
-                     schedule = StaticContinuation(rho = 1.0, muP_max = 1e6), muP = 1.0),
+                     schedule = StaticContinuation(kappa_P = 10.0, theta_P = 1.5, s_thresh = 1e-2, muP_max = 1e6), muP = 1.0),
                      linear_solver = LINEAR_SOLVER, nlp_scaling = false, print_level = MadNLP.ERROR)
         @printf("Quad StaticContinuation    : %-26s iters=%d  eqfeas=%.2e\n",
                 rsc.status, rsc.iter, eq_feas(nlp, rsc.solution[1:get_nvar(nlp)]))
@@ -291,7 +291,7 @@ let
     try
         for cfg in CONFIGS
             r = madnlp(nlp; equality_treatment = KernelPenaltyEquality(QuadraticKernel();
-                       schedule = StaticContinuation(rho = 1.0, muP_max = 1e6), muP = 1.0),
+                       schedule = StaticContinuation(kappa_P = 10.0, theta_P = 1.5, s_thresh = 1e-2, muP_max = 1e6), muP = 1.0),
                        kkt_system = cfg.kkt, linear_solver = cfg.ls,
                        nlp_scaling = false, print_level = MadNLP.ERROR)
             ok = r.status in (MadNLP.SOLVE_SUCCEEDED, MadNLP.SOLVED_TO_ACCEPTABLE_LEVEL)

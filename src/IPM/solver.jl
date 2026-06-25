@@ -246,15 +246,23 @@ function _update_penalty_mu!(eh::KernelPenaltyEquality, solver::AbstractMadNLPSo
 end
 update_penalty!(::FixedPenalty, eh, solver) = nothing
 
-# Default continuation: tie μ_P to the barrier μ_B (this schedule's own choice — the framework
-# does not assume it). μ_P = min(muP_max, muP0·(μB0/μB)^ρ). The schedule is the ONLY thing
-# controlling μ_P — there is no cliff guard; if a steep kernel overflows, the penalty wrappers
-# raise InvalidNumberException and the solve terminates, signalling that ρ/muP_max are too
-# aggressive. Stateless: μP0 from the handler, μB0 = barrier.mu_init.
+# Static (fixed-parameter) subproblem-gated continuation (see StaticContinuation in
+# equality_kernels.jl). Bump μ_P only when the penalty-barrier subproblem is solved
+# (get_inf_barrier ≤ ε_P(μ_P)) AND the equality-slack ∞-norm is small (keeps the cosh argument
+# μ_P·s well-conditioned). get_inf_barrier already folds in the penalty stationarity via
+# slack(f)=φ'(s). Decoupled from μ_B: the optimality tolerance depends on μ_P (default ε_P = 1/μ_P).
 function update_penalty!(sched::StaticContinuation, eh::KernelPenaltyEquality, solver::AbstractMadNLPSolver{T}) where T
-    μB  = get_mu(solver)
-    μB0 = T(get_opt(solver).barrier.mu_init)
-    eh.muP[] = min(T(sched.muP_max), eh.muP0 * (μB0 / μB)^T(sched.rho))
+    μ = eh.muP[]
+    if μ < sched.muP_max
+        E_opt   = get_inf_barrier(solver)                                    # subproblem optimality error
+        s_inf   = norm(view(slack(get_x(solver)), eh.ind_eqslack), Inf)      # ‖s_E‖∞ (GPU-safe)
+        opt_tol = T(sched.opt_tol_coef) * μ^T(sched.opt_tol_exp)             # ε_P(μ_P)
+        if E_opt <= opt_tol && s_inf <= T(sched.s_thresh)
+            eh.muP[] = min(T(sched.muP_max), max(T(sched.kappa_P) * μ, μ^T(sched.theta_P)))
+            sched.n_bumps[] += 1
+        end
+    end
+    sched.muP_cur[] = eh.muP[]
     return
 end
 
