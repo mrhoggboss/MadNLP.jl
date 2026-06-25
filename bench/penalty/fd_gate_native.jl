@@ -189,4 +189,44 @@ let
     end
 end
 
+# ---- Stage 2: μ_P continuation schedules (decoupled from μ_B) -----------------------
+# A user-defined schedule whose μ_P depends ONLY on the iteration count, never on μ_B —
+# proof that the schedule infrastructure is decoupled and that the filter correctly resets
+# on μ_P moves (otherwise this would stall). Defined entirely in user code.
+struct StepEveryK <: MadNLP.AbstractPenaltySchedule
+    factor::Float64
+    every::Int
+    muP_max::Float64
+end
+function MadNLP.update_penalty!(s::StepEveryK, eh, solver)
+    T = typeof(eh.muP[]); k = MadNLP.get_cnt(solver).k
+    (k > 0 && k % s.every == 0) && (eh.muP[] = min(T(s.muP_max), eh.muP[] * T(s.factor)))
+    return
+end
+
+println("\n=== Stage 2: μ_P continuation (StaticContinuation + a decoupled user schedule) ===")
+let
+    nlp = CUTEstModel("HS14"; decode = true)
+    try
+        # fixed μ at the same ceiling stalls (Stage-1 conditioning wall); continuation converges.
+        rfix = madnlp(nlp; equality_treatment = KernelPenaltyEquality(QuadraticKernel(); muP = 1e6),
+                      linear_solver = LINEAR_SOLVER, nlp_scaling = false, print_level = MadNLP.ERROR)
+        @printf("Quad fixed μ=1e6           : %-26s iters=%d\n", rfix.status, rfix.iter)
+        rsc = madnlp(nlp; equality_treatment = KernelPenaltyEquality(QuadraticKernel();
+                     schedule = StaticContinuation(rho = 1.0, muP_max = 1e6), muP = 1.0),
+                     linear_solver = LINEAR_SOLVER, nlp_scaling = false, print_level = MadNLP.ERROR)
+        @printf("Quad StaticContinuation    : %-26s iters=%d  eqfeas=%.2e\n",
+                rsc.status, rsc.iter, eq_feas(nlp, rsc.solution[1:get_nvar(nlp)]))
+        rdk = madnlp(nlp; equality_treatment = KernelPenaltyEquality(QuadraticKernel();
+                     schedule = StepEveryK(3.0, 5, 1e6), muP = 1.0),
+                     linear_solver = LINEAR_SOLVER, nlp_scaling = false, print_level = MadNLP.ERROR)
+        ok = rdk.status in (MadNLP.SOLVE_SUCCEEDED, MadNLP.SOLVED_TO_ACCEPTABLE_LEVEL)
+        @printf("Decoupled StepEveryK (∌μ_B): %-26s iters=%d  eqfeas=%.2e  %s\n",
+                rdk.status, rdk.iter, eq_feas(nlp, rdk.solution[1:get_nvar(nlp)]),
+                ok ? "(decoupled schedule converged — OK)" : "<-- EXPECTED CONVERGENCE")
+    finally
+        finalize(nlp)
+    end
+end
+
 println("\nGATE_SCRIPT_DONE")

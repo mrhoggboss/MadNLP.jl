@@ -15,7 +15,7 @@ import LDLFactorizations
 import MUMPS_seq_jll, OpenBLAS32_jll
 
 export MadNLPSolver, MadNLPOptions, LDLSolver, LapackCPUSolver, MumpsSolver, MadNLPExecutionStats, madnlp, solve!, madsuite, SchurComplementKKTSystem
-export KernelPenaltyEquality, AbstractEqualityKernel, QuadraticKernel, CoshKernel, CoshNormalizedKernel, AbstractPenaltySchedule, FixedPenalty
+export KernelPenaltyEquality, AbstractEqualityKernel, QuadraticKernel, CoshKernel, CoshNormalizedKernel, AbstractPenaltySchedule, FixedPenalty, StaticContinuation
 Base.USE_GPL_LIBS && export UmfpackSolver, CHOLMODSolver
 
 function __init__()

@@ -213,13 +213,50 @@ color_status(status::Status) =
     status <= SOLVED_TO_ACCEPTABLE_LEVEL ? :blue : :red
 
 
-# Advance the penalty parameter μ of a KernelPenaltyEquality handler once per iteration,
-# via its pluggable schedule. No-op for every other equality treatment, and for the
-# Stage-1 `FixedPenalty` schedule (μ held at its initial value).
+# Advance the penalty parameter μ_P via the handler's pluggable schedule, once per iteration.
+# μ_P and the barrier μ_B are DECOUPLED: the schedule gets the whole solver and may move μ_P by
+# any rule (a function of μ_B, of the constraint residual, of the iteration count, …). Its sole
+# job is to set `eh.muP[]`; the framework below handles the consequences of the move.
+#
+# We treat (μ_P, μ_B) as a joint barrier/penalty state. Whenever μ_P moves, the penalized filter
+# merit `varphi` changes, so — exactly as MadNLP resets the filter on a μ_B move (barrier.jl) —
+# we reset the filter and re-cache the penalty terms at the new μ_P. No-op for non-penalty
+# treatments and for the `FixedPenalty` schedule (μ_P never moves).
 update_penalty_mu!(solver::AbstractMadNLPSolver) = _update_penalty_mu!(get_cb(solver).equality_handler, solver)
-_update_penalty_mu!(::AbstractEqualityTreatment, solver) = nothing 
-_update_penalty_mu!(eh::KernelPenaltyEquality, solver) = update_penalty!(eh.schedule, eh, solver)
+_update_penalty_mu!(::AbstractEqualityTreatment, solver) = nothing
+function _update_penalty_mu!(eh::KernelPenaltyEquality, solver::AbstractMadNLPSolver{T}) where T
+    muP_old = eh.muP[]
+    update_penalty!(eh.schedule, eh, solver)        # schedule's sole job: set eh.muP[]
+    if eh.muP[] != muP_old
+        # μ_P moved ⇒ the penalized merit varphi changed ⇒ the filter is stale. Reset it
+        # exactly like a μ_B update does (barrier.jl): the anchor (theta_max, -Inf) is
+        # penalty-independent (theta = ‖c-s-rhs‖₁), so it stays valid for ANY μ_P move
+        # (increase OR cliff-guard decrease).
+        empty!(get_filter(solver))
+        push!(get_filter(solver), (get_theta_max(solver), -T(Inf)))
+        # Re-cache the penalty terms at the NEW μ_P so the whole Newton/line-search step is
+        # consistent: (i) slack(f) = φ'(s; μ_P_new) feeds the Newton RHS (set_aug_rhs!) and the
+        # line-search directional derivative; (ii) get_obj_val is the Armijo baseline varphi,
+        # re-evaluated at μ_P_new so it matches the trial merits. (D_s in set_aug_diagonal! and
+        # the trial objectives read eh.muP[] live, so they need no refresh.)
+        penalty_gradient!(solver, eh, slack(get_f(solver)), slack(get_x(solver)))
+        set_obj_val!(solver, eval_f_wrapper(solver, get_x(solver)))
+    end
+    return
+end
 update_penalty!(::FixedPenalty, eh, solver) = nothing
+
+# Default continuation: tie μ_P to the barrier μ_B (this schedule's own choice — the framework
+# does not assume it). μ_P = min(muP_max, muP0·(μB0/μB)^ρ). The schedule is the ONLY thing
+# controlling μ_P — there is no cliff guard; if a steep kernel overflows, the penalty wrappers
+# raise InvalidNumberException and the solve terminates, signalling that ρ/muP_max are too
+# aggressive. Stateless: μP0 from the handler, μB0 = barrier.mu_init.
+function update_penalty!(sched::StaticContinuation, eh::KernelPenaltyEquality, solver::AbstractMadNLPSolver{T}) where T
+    μB  = get_mu(solver)
+    μB0 = T(get_opt(solver).barrier.mu_init)
+    eh.muP[] = min(T(sched.muP_max), eh.muP0 * (μB0 / μB)^T(sched.rho))
+    return
+end
 
 function regular!(solver::AbstractMadNLPSolver{T}) where T
     while true

@@ -83,3 +83,32 @@ Keep `μ` constant at its initial value (no continuation). The Stage-1 default.
 struct FixedPenalty <: AbstractPenaltySchedule end
 # `update_penalty!(::FixedPenalty, handler, solver)` is a no-op; defined in
 # `src/IPM/solver.jl` next to the solver-loop hook so `solver` accessors are in scope.
+
+"""
+    StaticContinuation(; rho = 1.0, muP_max = Inf) <: AbstractPenaltySchedule
+
+Default continuation schedule. Ties the penalty parameter `μ_P` to the barrier parameter
+`μ_B` (its own choice — the solver framework does not assume `μ_P` depends on `μ_B`):
+
+    μ_P = min(muP_max, muP0 * (mu_init / μ_B)^rho)
+
+`muP0` is read from the handler and `mu_init` from the barrier, so the schedule carries no
+per-solve state (the current `μ_P` lives in the handler's `Ref`, re-materialized each solve).
+Because `μ_B` is piecewise-constant (it only changes when the barrier tightens), `μ_P` moves
+only on iterations where `μ_B` already moved — so this schedule adds no extra filter resets.
+
+There is NO overflow safeguard: the schedule is the only thing controlling `μ_P`. With a steep
+kernel ([`CoshKernel`](@ref)) an aggressive `rho`/`muP_max` can drive `μ_P·s` past the overflow
+threshold, which terminates the solve with an `InvalidNumberException` — that is intentional
+feedback; tune `rho`/`muP_max` down.
+
+Pass it to the treatment, e.g.
+`KernelPenaltyEquality(CoshKernel(); schedule = StaticContinuation(rho=0.85, muP_max=1e4), muP=1.0)`.
+"""
+struct StaticContinuation <: AbstractPenaltySchedule
+    rho::Float64       # continuation exponent (μ_P ∝ μ_B^{-rho})
+    muP_max::Float64   # hard cap on μ_P (Inf = uncapped)
+end
+StaticContinuation(; rho::Real = 1.0, muP_max::Real = Inf) =
+    StaticContinuation(Float64(rho), Float64(muP_max))
+# `update_penalty!(::StaticContinuation, handler, solver)` is defined in `src/IPM/solver.jl`.
