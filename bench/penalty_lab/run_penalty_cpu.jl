@@ -22,20 +22,16 @@ const NW     = min(length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 22, 23)   # shared 
 # ============ PENALTY GRID (edit me) ============
 # Schedule: bump μ_P when get_inf_barrier ≤ c_opt·μ_P^p_opt  AND  ‖s_E‖∞ ≤ s_thresh/μ_P,
 #           via  μ_P ← min(muP_max, max(kappa_P·μ_P, μ_P^theta_P)).
-# Defaults: ε_P = 1/μ_P (c_opt=1,p_opt=-1), slack gate 1/μ_P (s_thresh=1), muP0=10, muP_max=1e7.
-const BASE = (c_opt = 1.0, p_opt = -1.0, s_thresh = 1.0, muP0 = 10.0, muP_max = 1.0e7, tol = 1.0e-8)
+# Defaults: ε_P = 1/μ_P (c_opt=1,p_opt=-1), slack gate 1/μ_P (s_thresh=1), muP_max=1e7.
+# muP0=2.0 so the superlinear bump engages (μ_P^θ_P > μ_P for μ_P=2; would be a no-op at μ_P=1).
+const BASE = (c_opt = 1.0, p_opt = -1.0, s_thresh = 1.0, muP0 = 2.0, muP_max = 1.0e7, tol = 1.0e-8)
 const CONFIGS = [
-    # purely LINEAR (theta_P = 1 ⇒ bump = kappa_P·μ_P), sweep kappa_P
-    (name = "lin_k2",   cfg = merge(BASE, (kappa_P = 2.0,  theta_P = 1.0))),
-    (name = "lin_k5",   cfg = merge(BASE, (kappa_P = 5.0,  theta_P = 1.0))),
-    (name = "lin_k10",  cfg = merge(BASE, (kappa_P = 10.0, theta_P = 1.0))),
-    (name = "lin_k20",  cfg = merge(BASE, (kappa_P = 20.0, theta_P = 1.0))),
-    # purely SUPERLINEAR (kappa_P = 1 ⇒ bump = μ_P^theta_P), sweep theta_P
-    (name = "sup_t1.1",  cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.1))),
-    (name = "sup_t1.25", cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.25))),
-    (name = "sup_t1.5",  cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.5))),
-    (name = "sup_t1.75", cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.75))),
-    (name = "sup_t2",    cfg = merge(BASE, (kappa_P = 1.0, theta_P = 2.0))),
+    # purely SUPERLINEAR (kappa_P = 1 ⇒ bump = μ_P^theta_P), sweep theta_P, muP0=2
+    (name = "sup2_t1.1",  cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.1))),
+    (name = "sup2_t1.25", cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.25))),
+    (name = "sup2_t1.5",  cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.5))),
+    (name = "sup2_t1.75", cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.75))),
+    (name = "sup2_t2",    cfg = merge(BASE, (kappa_P = 1.0, theta_P = 2.0))),
 ]
 # ================================================
 
@@ -117,15 +113,17 @@ for c in CONFIGS
         end
     end
     rows = [r for r in results if r isa NamedTuple]
-    succ = count(r -> r.status == "SOLVE_SUCCEEDED", rows)
-    acc  = count(r -> occursin("ACCEPTABLE", r.status), rows)
-    push!(summary, (c.name, succ, acc, length(rows) - succ - acc))
-    println("  $(c.name): SUCCEEDED=$succ ACCEPTABLE=$acc OTHER=$(length(rows)-succ-acc)  → $(basename(csv))")
+    # TIGHT success metric (no loose ACCEPTABLE): SOLVE_SUCCEEDED AND eqfeas ≤ 1e-8.
+    tight = count(r -> r.status == "SOLVE_SUCCEEDED" && r.eqfeas <= 1e-8, rows)
+    succ  = count(r -> r.status == "SOLVE_SUCCEEDED", rows)
+    acc   = count(r -> occursin("ACCEPTABLE", r.status), rows)
+    push!(summary, (c.name, tight, succ, acc))
+    println("  $(c.name): TIGHT(succ&eqf≤1e-8)=$tight  [SUCCEEDED=$succ ACCEPTABLE=$acc OTHER=$(length(rows)-succ-acc)]  → $(basename(csv))")
 end
 
-println("\n=== GRID SUMMARY ($REGIME, condensed, cosh, tol=1e-8) ===")
-println(rpad("config", 12), lpad("SUCC", 6), lpad("ACC", 5), lpad("OTHER", 7))
-for (nm, s, a, o) in summary
-    println(rpad(nm, 12), lpad(s, 6), lpad(a, 5), lpad(o, 7))
+println("\n=== GRID SUMMARY ($REGIME, condensed, cosh, tol=1e-8) — TIGHT = SUCCEEDED & eqfeas≤1e-8 ===")
+println(rpad("config", 13), lpad("TIGHT", 7), lpad("SUCC", 6), lpad("ACC", 5))
+for (nm, t, s, a) in summary
+    println(rpad(nm, 13), lpad(t, 7), lpad(s, 6), lpad(a, 5))
 end
 println("PENALTY_GRID_DONE")
