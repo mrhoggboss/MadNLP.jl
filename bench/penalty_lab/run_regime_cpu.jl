@@ -11,9 +11,12 @@
 # master to warm the shared cache, then (2) solve in PARALLEL with `CUTEstModel(...; decode=false)`,
 # which only dlopens the cached .so (read-only → race-free).
 #
-# Usage: julia --project=bench/penalty bench/penalty_lab/run_regime_cpu.jl [regime] [nworkers]
-#   regime default le5000_eq    nworkers default 24
-# Writes results/cpu_baseline/<regime>.csv  (one row per problem × KKT system).
+# Usage: julia --project=bench/penalty bench/penalty_lab/run_regime_cpu.jl [regime] [nworkers] [kkt] [tol]
+#   regime   default le5000_eq
+#   nworkers default 22 (clamped to 23; shared node)
+#   kkt      {both|aug|cond}  default both
+#   tol      a number to OVERRIDE MadNLP's per-KKT default tol, or "default"  (default "default")
+# Writes results/cpu_baseline/<regime>[_<kkt>][_tol<tol>].csv  (one row per problem × KKT system).
 
 using Distributed
 
@@ -23,9 +26,11 @@ const REGIME = length(ARGS) >= 1 ? ARGS[1] : "le5000_eq"
 # Shared compute node: never use more than 24 cores. Default 22 workers (+ near-idle master ≤ 24);
 # clamp any larger request to 23 so workers + master stay within 24.
 const NW     = min(length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 22, 23)
+const KKT_SEL = length(ARGS) >= 3 ? ARGS[3] : "both"                                   # both | aug | cond
+const TOL     = (length(ARGS) >= 4 && ARGS[4] != "default") ? parse(Float64, ARGS[4]) : nothing  # nothing = MadNLP default
 
 probs = String.(filter(!isempty, strip.(readlines(joinpath(HERE, "regimes", "$REGIME.txt")))))  # String, not SubString
-println("regime=$REGIME  problems=$(length(probs))  workers=$NW")
+println("regime=$REGIME  problems=$(length(probs))  workers=$NW  kkt=$KKT_SEL  tol=$(TOL === nothing ? "default" : TOL)")
 
 # ---- Phase 1: serial pre-decode (warm the shared cache; concurrent decode would race) ----
 using MadNLP, CUTEst, NLPModels
@@ -59,7 +64,7 @@ addprocs(NW; exeflags = "--project=$(PROJ)")
         lc = NLPModels.get_lcon(nlp); uc = NLPModels.get_ucon(nlp)
         return Float64(maximum(abs.(c .- lc) .* (lc .== uc)))
     end
-    function solve_one(name::AbstractString, kkt)
+    function solve_one(name::AbstractString, kkt, tol)
         local nlp
         try
             nlp = CUTEstModel(name; decode = false)
@@ -70,7 +75,8 @@ addprocs(NW; exeflags = "--project=$(PROJ)")
         end
         try
             nvar, ncon = nlp.meta.nvar, nlp.meta.ncon
-            t = @elapsed r = madnlp(nlp; kkt_system = kkt, max_wall_time = MAXWALL, print_level = MadNLP.ERROR)
+            tolkw = tol === nothing ? (;) : (; tol = tol)   # omit ⇒ MadNLP's per-KKT default
+            t = @elapsed r = madnlp(nlp; kkt_system = kkt, max_wall_time = MAXWALL, print_level = MadNLP.ERROR, tolkw...)
             return (name=name, kkt=string(nameof(kkt)), nvar=nvar, ncon=ncon,
                     status=string(r.status), iter=r.iter, nfact=r.counters.factorization_cnt,
                     time=t, eqfeas=_eqfeas(nlp, r.solution), obj=Float64(r.objective), tol=r.options.tol)
@@ -84,9 +90,12 @@ addprocs(NW; exeflags = "--project=$(PROJ)")
     end
 end
 
-jobs = [(p, kkt) for kkt in (MadNLP.SparseKKTSystem, MadNLP.SparseCondensedKKTSystem) for p in good]
+kkts = KKT_SEL == "aug"  ? (MadNLP.SparseKKTSystem,) :
+       KKT_SEL == "cond" ? (MadNLP.SparseCondensedKKTSystem,) :
+                           (MadNLP.SparseKKTSystem, MadNLP.SparseCondensedKKTSystem)
+jobs = [(p, kkt) for kkt in kkts for p in good]
 println("solving $(length(jobs)) (problem × kkt) on $NW workers...")
-results = pmap(j -> solve_one(j[1], j[2]), jobs;
+results = pmap(j -> solve_one(j[1], j[2], TOL), jobs;
                on_error = ex -> (:__EXC, string(typeof(ex)), first(split(sprint(showerror, ex), '\n'))))
 let excs = [r for r in results if r isa Tuple && length(r) == 3 && r[1] === :__EXC]
     if !isempty(excs)
@@ -97,12 +106,14 @@ end
 
 # ---- write CSV ----
 outdir = joinpath(HERE, "results", "cpu_baseline"); mkpath(outdir)
-csv = joinpath(outdir, "$REGIME.csv")
+kkttag = KKT_SEL == "both" ? "" : "_$(KKT_SEL)"
+toltag = TOL === nothing ? "" : "_tol$(TOL)"
+csv = joinpath(outdir, "$(REGIME)$(kkttag)$(toltag).csv")
 cols = (:name, :kkt, :nvar, :ncon, :status, :iter, :nfact, :time, :eqfeas, :obj, :tol)
 open(csv, "w") do io
     println(io, join(cols, ","))
-    for p in predecode_failed, kkt in ("SparseKKTSystem", "SparseCondensedKKTSystem")
-        println(io, join((p, kkt, -1, -1, "DECODE_ERROR", -1, -1, 0.0, NaN, NaN, NaN), ","))
+    for p in predecode_failed, kkt in kkts
+        println(io, join((p, string(nameof(kkt)), -1, -1, "DECODE_ERROR", -1, -1, 0.0, NaN, NaN, NaN), ","))
     end
     for (j, res) in zip(jobs, results)
         st = res isa Tuple && length(res) == 3 && res[1] === :__EXC ? _san("CRASH:" * res[3]) : "CRASH"
@@ -114,10 +125,11 @@ open(csv, "w") do io
 end
 println("wrote $csv")
 
-for kkt in ("SparseKKTSystem", "SparseCondensedKKTSystem")
-    rows = [r for r in results if r isa NamedTuple && r.kkt == kkt]
+for kkt in kkts
+    nm = string(nameof(kkt))
+    rows = [r for r in results if r isa NamedTuple && r.kkt == nm]
     succ = count(r -> r.status == "SOLVE_SUCCEEDED", rows)
     acc  = count(r -> occursin("ACCEPTABLE", r.status), rows)
-    println("$kkt: $(length(rows)) solves  SUCCEEDED=$succ  ACCEPTABLE=$acc  OTHER=$(length(rows)-succ-acc)")
+    println("$nm: $(length(rows)) solves  SUCCEEDED=$succ  ACCEPTABLE=$acc  OTHER=$(length(rows)-succ-acc)")
 end
 println("REGIME_CPU_DONE")
