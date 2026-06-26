@@ -94,7 +94,7 @@ end
 
 outdir = joinpath(HERE, "results", "penalty"); mkpath(outdir)
 cols = (:name, :nvar, :ncon, :status, :iter, :nfact, :time, :eqfeas, :obj, :muP0, :muP_final, :n_bumps)
-summary = Tuple{String,Int,Int,Int}[]
+summary = NamedTuple[]
 for c in CONFIGS
     println("\n=== config $(c.name)  $(c.cfg) ===")
     results = pmap(p -> solve_one(p, c.cfg), good;
@@ -113,17 +113,39 @@ for c in CONFIGS
         end
     end
     rows = [r for r in results if r isa NamedTuple]
-    # TIGHT success metric (no loose ACCEPTABLE): SOLVE_SUCCEEDED AND eqfeas ≤ 1e-8.
+    # Record BOTH success states: TIGHT (SOLVE_SUCCEEDED AND eqfeas ≤ 1e-8) and SUCCEEDED.
     tight = count(r -> r.status == "SOLVE_SUCCEEDED" && r.eqfeas <= 1e-8, rows)
     succ  = count(r -> r.status == "SOLVE_SUCCEEDED", rows)
     acc   = count(r -> occursin("ACCEPTABLE", r.status), rows)
-    push!(summary, (c.name, tight, succ, acc))
-    println("  $(c.name): TIGHT(succ&eqf≤1e-8)=$tight  [SUCCEEDED=$succ ACCEPTABLE=$acc OTHER=$(length(rows)-succ-acc)]  → $(basename(csv))")
+    push!(summary, (name=c.name, kappa_P=c.cfg.kappa_P, theta_P=c.cfg.theta_P, muP0=c.cfg.muP0,
+                    s_thresh=c.cfg.s_thresh, n=length(rows), tight=tight, succ=succ, acc=acc,
+                    other=length(rows)-succ-acc))
+    println("  $(c.name): TIGHT=$tight  SUCCEEDED=$succ  [ACCEPTABLE=$acc OTHER=$(length(rows)-succ-acc)]  → $(basename(csv))")
 end
 
+# ---- persist BOTH success states per config (cumulative; one row per regime,config, latest wins) ----
+sumfile = joinpath(outdir, "summary.csv")
+sumcols = ("regime","config","kappa_P","theta_P","muP0","s_thresh","n","tight","succeeded","acceptable","other")
+keys_now = Set(string(REGIME, ",", s.name) for s in summary)
+kept = String[]
+if isfile(sumfile)
+    ls = readlines(sumfile)
+    for ln in (length(ls) >= 2 ? ls[2:end] : String[])
+        join(split(ln, ",")[1:2], ",") in keys_now || push!(kept, ln)
+    end
+end
+open(sumfile, "w") do io
+    println(io, join(sumcols, ","))
+    foreach(ln -> println(io, ln), kept)
+    for s in summary
+        println(io, join((REGIME, s.name, s.kappa_P, s.theta_P, s.muP0, s.s_thresh, s.n, s.tight, s.succ, s.acc, s.other), ","))
+    end
+end
+println("recorded success states (tight + succeeded) → $sumfile")
+
 println("\n=== GRID SUMMARY ($REGIME, condensed, cosh, tol=1e-8) — TIGHT = SUCCEEDED & eqfeas≤1e-8 ===")
-println(rpad("config", 13), lpad("TIGHT", 7), lpad("SUCC", 6), lpad("ACC", 5))
-for (nm, t, s, a) in summary
-    println(rpad(nm, 13), lpad(t, 7), lpad(s, 6), lpad(a, 5))
+println(rpad("config", 13), lpad("TIGHT", 7), lpad("SUCC", 6), lpad("OTHER", 7))
+for s in summary
+    println(rpad(s.name, 13), lpad(s.tight, 7), lpad(s.succ, 6), lpad(s.other, 7))
 end
 println("PENALTY_GRID_DONE")
