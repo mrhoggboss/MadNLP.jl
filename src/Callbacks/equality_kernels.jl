@@ -96,9 +96,10 @@ iteration, bump `μ_P` **iff both** gates hold:
      The default `opt_tol_coef = 1, opt_tol_exp = -1` gives `ε_P(μ_P) = 1/μ_P`. Here
      `get_inf_barrier = max(inf_pr, inf_du, inf_compl_mu)`; `inf_du` already includes the penalty
      stationarity φ'(s) − y, so this is the *penalty*-barrier subproblem error.
-  2. the equality-slack ∞-norm, scaled by 1/μ_P, is small enough to keep the cosh argument bounded:
-         `‖s_E‖∞ ≤ s_thresh / μ_P`   (so μ_P·‖s_E‖∞ ≤ s_thresh — the cosh argument μ_P·s in
-         `kernel_hess = μ_P²·cosh(μ_P·s)` stays ≲ s_thresh right after the bump). Default `s_thresh = 1`.
+  2. the equality slack is small enough at the NEXT μ_P (the post-bump value `μ_P⁺ = min(muP_max,
+     max(kappa_P·μ_P, μ_P^theta_P))`) to keep the cosh argument bounded:
+         `‖s_E‖∞ ≤ s_thresh / μ_P⁺`   (so `μ_P⁺·‖s_E‖∞ ≤ s_thresh` — the cosh argument μ_P·s in
+         `kernel_hess = μ_P²·cosh(μ_P·s)` stays ≲ s_thresh right AFTER the bump). Default `s_thresh = 1`.
 
 The bump is the Ipopt-style superlinear step, capped:
 

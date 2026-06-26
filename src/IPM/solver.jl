@@ -248,17 +248,19 @@ update_penalty!(::FixedPenalty, eh, solver) = nothing
 
 # Static (fixed-parameter) subproblem-gated continuation (see StaticContinuation in
 # equality_kernels.jl). Bump μ_P only when the penalty-barrier subproblem is solved
-# (get_inf_barrier ≤ ε_P(μ_P)) AND the equality-slack ∞-norm is small (keeps the cosh argument
-# μ_P·s well-conditioned). get_inf_barrier already folds in the penalty stationarity via
-# slack(f)=φ'(s). Decoupled from μ_B: the optimality tolerance depends on μ_P (default ε_P = 1/μ_P).
+# (get_inf_barrier ≤ ε_P(μ_P)) AND the equality slack is small enough AT THE NEXT μ_P so the cosh
+# argument μ_P·s stays bounded right after the bump. get_inf_barrier already folds in φ'(s) via
+# slack(f). Decoupled from μ_B: the optimality tolerance depends on μ_P (default ε_P = 1/μ_P).
 function update_penalty!(sched::StaticContinuation, eh::KernelPenaltyEquality, solver::AbstractMadNLPSolver{T}) where T
     μ = eh.muP[]
     if μ < sched.muP_max
+        μ_next  = min(T(sched.muP_max), max(T(sched.kappa_P) * μ, μ^T(sched.theta_P)))  # deterministic NEXT μ_P
         E_opt   = get_inf_barrier(solver)                                    # subproblem optimality error
         s_inf   = norm(view(slack(get_x(solver)), eh.ind_eqslack), Inf)      # ‖s_E‖∞ (GPU-safe)
-        opt_tol = T(sched.opt_tol_coef) * μ^T(sched.opt_tol_exp)             # ε_P(μ_P)
-        if E_opt <= opt_tol && s_inf <= T(sched.s_thresh) / μ                # gate scaled by 1/μ_P ⇒ μ_P·s ≲ s_thresh
-            eh.muP[] = min(T(sched.muP_max), max(T(sched.kappa_P) * μ, μ^T(sched.theta_P)))
+        opt_tol = T(sched.opt_tol_coef) * μ^T(sched.opt_tol_exp)             # ε_P(μ_P) at CURRENT μ_P
+        # slack gate at the NEXT μ_P ⇒ μ_next·s ≤ s_thresh, bounding the cosh argument AFTER the bump:
+        if E_opt <= opt_tol && s_inf <= T(sched.s_thresh) / μ_next
+            eh.muP[] = μ_next
             sched.n_bumps[] += 1
         end
     end
