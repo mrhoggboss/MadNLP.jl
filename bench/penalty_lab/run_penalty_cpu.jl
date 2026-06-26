@@ -26,12 +26,11 @@ const NW     = min(length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 22, 23)   # shared 
 # muP0=2.0 so the superlinear bump engages (μ_P^θ_P > μ_P for μ_P=2; would be a no-op at μ_P=1).
 const BASE = (c_opt = 1.0, p_opt = -1.0, s_thresh = 1.0, muP0 = 2.0, muP_max = 1.0e7, tol = 1.0e-8)
 const CONFIGS = [
-    # purely SUPERLINEAR (kappa_P = 1 ⇒ bump = μ_P^theta_P), sweep theta_P, muP0=2
-    (name = "sup2_t1.1",  cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.1))),
-    (name = "sup2_t1.25", cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.25))),
-    (name = "sup2_t1.5",  cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.5))),
-    (name = "sup2_t1.75", cfg = merge(BASE, (kappa_P = 1.0, theta_P = 1.75))),
-    (name = "sup2_t2",    cfg = merge(BASE, (kappa_P = 1.0, theta_P = 2.0))),
+    # purely LINEAR (theta_P = 1 ⇒ bump = kappa_P·μ_P), sweep kappa_P, muP0=2 (matches the sup2 sweep)
+    (name = "lin2_k2",  cfg = merge(BASE, (kappa_P = 2.0,  theta_P = 1.0))),
+    (name = "lin2_k5",  cfg = merge(BASE, (kappa_P = 5.0,  theta_P = 1.0))),
+    (name = "lin2_k10", cfg = merge(BASE, (kappa_P = 10.0, theta_P = 1.0))),
+    (name = "lin2_k20", cfg = merge(BASE, (kappa_P = 20.0, theta_P = 1.0))),
 ]
 # ================================================
 
