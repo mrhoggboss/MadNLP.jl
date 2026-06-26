@@ -76,7 +76,10 @@ addprocs(NW; exeflags = "--project=$(PROJ)")
         try
             nvar, ncon = nlp.meta.nvar, nlp.meta.ncon
             tolkw = tol === nothing ? (;) : (; tol = tol)   # omit ⇒ MadNLP's per-KKT default
-            t = @elapsed r = madnlp(nlp; kkt_system = kkt, max_wall_time = MAXWALL, print_level = MadNLP.ERROR, tolkw...)
+            # acceptable_tol=0 ⇒ no ACCEPTABLE exit (experiment policy): inf_total>0 ≥ 0 never holds
+            # before SUCCEEDED, so acceptable_cnt stays 0 (and line-search fallbacks → SEARCH_DIR).
+            t = @elapsed r = madnlp(nlp; kkt_system = kkt, acceptable_tol = 0.0,
+                                    max_wall_time = MAXWALL, print_level = MadNLP.ERROR, tolkw...)
             return (name=name, kkt=string(nameof(kkt)), nvar=nvar, ncon=ncon,
                     status=string(r.status), iter=r.iter, nfact=r.counters.factorization_cnt,
                     time=t, eqfeas=_eqfeas(nlp, r.solution), obj=Float64(r.objective), tol=r.options.tol)
