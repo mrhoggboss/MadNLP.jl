@@ -22,15 +22,15 @@ const NW     = min(length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 22, 23)   # shared 
 # ============ PENALTY GRID (edit me) ============
 # Schedule: bump μ_P when get_inf_barrier ≤ c_opt·μ_P^p_opt  AND  ‖s_E‖∞ ≤ s_thresh/μ_P,
 #           via  μ_P ← min(muP_max, max(kappa_P·μ_P, μ_P^theta_P)).
-# Defaults: ε_P = 1/μ_P (c_opt=1,p_opt=-1), slack gate 1/μ_P (s_thresh=1), muP_max=1e7.
-# muP0=2.0 so the superlinear bump engages (μ_P^θ_P > μ_P for μ_P=2; would be a no-op at μ_P=1).
-const BASE = (c_opt = 1.0, p_opt = -1.0, s_thresh = 1.0, muP0 = 2.0, muP_max = 1.0e7, tol = 1.0e-8)
+# Defaults: ε_P = 1/μ_P (c_opt=1,p_opt=-1), muP_max=1e7, muP0=2.0.
+# s_thresh=700 ⇒ LOOSE slack gate ‖s_E‖∞ ≤ 700/μ_P (i.e. μ_P·s ≤ 700, just below the cosh
+# overflow ~709): lets μ_P keep advancing while s is still large early (far from the central path).
+const BASE = (c_opt = 1.0, p_opt = -1.0, s_thresh = 700.0, muP0 = 2.0, muP_max = 1.0e7, tol = 1.0e-8)
 const CONFIGS = [
-    # purely LINEAR (theta_P = 1 ⇒ bump = kappa_P·μ_P), sweep kappa_P, muP0=2 (matches the sup2 sweep)
-    (name = "lin2_k2",  cfg = merge(BASE, (kappa_P = 2.0,  theta_P = 1.0))),
-    (name = "lin2_k5",  cfg = merge(BASE, (kappa_P = 5.0,  theta_P = 1.0))),
-    (name = "lin2_k10", cfg = merge(BASE, (kappa_P = 10.0, theta_P = 1.0))),
-    (name = "lin2_k20", cfg = merge(BASE, (kappa_P = 20.0, theta_P = 1.0))),
+    # LINEAR (theta_P=1, bump = kappa_P·μ_P) with LOOSE slack gate s_thresh=700, sweep kappa_P
+    (name = "lin_s700_k2",  cfg = merge(BASE, (kappa_P = 2.0,  theta_P = 1.0))),
+    (name = "lin_s700_k5",  cfg = merge(BASE, (kappa_P = 5.0,  theta_P = 1.0))),
+    (name = "lin_s700_k10", cfg = merge(BASE, (kappa_P = 10.0, theta_P = 1.0))),
 ]
 # ================================================
 
