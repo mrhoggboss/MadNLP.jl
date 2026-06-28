@@ -24,7 +24,8 @@ function penalty_objective(eh::KernelPenaltyEquality, s)
     μ = eh.muP[]
     kernel = eh.kernel        # bind the singleton kernel locally: the mapreduce closure must
     se = view(s, eh.ind_eqslack)   # capture only bitstype values (kernel, μ) — NOT the handler
-    return mapreduce(si -> kernel_val(kernel, μ, si), +, se; init = zero(eltype(s)))   # (eh holds GPU arrays)
+    pen = mapreduce(si -> kernel_val(kernel, μ, si), +, se; init = zero(eltype(s)))   # (eh holds GPU arrays)
+    return pen + dot(eh.lambda, se)   # φ_A = Σφ(μ,sᵢ) + λᵀs (augmented-Lagrangian linear term; λ≡0 ⇒ pure penalty)
 end
 
 # Checked version used by eval_f_wrapper: terminate the solve if the penalty overflowed.
@@ -45,10 +46,20 @@ function penalty_gradient!(solver, eh::KernelPenaltyEquality, sf, s)
     μ = eh.muP[]
     es = eh.ind_eqslack
     # Overwrite (not accumulate): `slack(f)` persists across iterations and is otherwise 0,
-    # so only the equality-slack entries carry φ'(s); the rest must stay 0.
-    @views sf[es] .= kernel_grad.(Ref(eh.kernel), μ, s[es])
+    # so only the equality-slack entries carry φ'_A(s); the rest must stay 0.
+    @views sf[es] .= kernel_grad.(Ref(eh.kernel), μ, s[es]) .+ eh.lambda   # φ'_A = φ'(μ,s) + λ
     is_valid(view(sf, es)) || _penalty_overflow(solver, eh, :grad)
     return
+end
+
+# True equality-feasibility gate for termination: ‖s_E‖∞ ≤ tol. The freed slack s = c_E(x)-b is NOT
+# part of get_inf_total, so a pure/augmented penalty can satisfy the scaled KKT with s still loose;
+# this conjunct keeps SOLVE_SUCCEEDED honest (and is what lets the ALM certify s→0). No-op (always
+# feasible) for every non-penalty treatment.
+penalty_eq_feasible(::AbstractEqualityTreatment, solver, tol) = true
+function penalty_eq_feasible(eh::KernelPenaltyEquality, solver, tol)
+    isempty(eh.ind_eqslack) && return true
+    return norm(view(slack(get_x(solver)), eh.ind_eqslack), Inf) <= tol
 end
 
 function eval_f_wrapper(solver::AbstractMadNLPSolver{T}, x::PrimalVector{T}) where T

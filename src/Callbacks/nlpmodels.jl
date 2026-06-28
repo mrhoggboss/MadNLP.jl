@@ -125,6 +125,8 @@ struct KernelPenaltyEquality{T, VT, VI, K<:AbstractEqualityKernel, S<:AbstractPe
     muP::Base.RefValue{T}    # current penalty parameter (mutable; advanced by `schedule`)
     ind_eqslack::VI          # positions of the equality rows within the slack vector
     b::VT                    # equality targets, one per equality row (length == length(ind_eqslack))
+    lambda::VT               # augmented-Lagrangian multiplier estimate, one per eq slack (internal/scaled
+                             # y-space); λ ≡ 0 ⇒ φ_A == pure penalty, so non-ALM schedules are unaffected.
 end
 
 # User-facing constructor: a *spec* (kernel + schedule + initial μ). The model-sized
@@ -135,7 +137,7 @@ function KernelPenaltyEquality(
     muP::Real = 1.0, # placeholder; we expect to start higher.
 )
     T = typeof(float(muP))
-    return KernelPenaltyEquality(kernel, schedule, T(muP), Ref(T(muP)), Int[], T[])
+    return KernelPenaltyEquality(kernel, schedule, T(muP), Ref(T(muP)), Int[], T[], T[])
 end
 
 # Materialize the equality handler against the model. A treatment passed as a *type*
@@ -148,7 +150,9 @@ create_equality_handler(::Type{<:KernelPenaltyEquality}, lcon, ucon) =
     create_equality_handler(KernelPenaltyEquality(), lcon, ucon)
 function create_equality_handler(spec::KernelPenaltyEquality, lcon, ucon)
     ind = findall(lcon .== ucon)
-    return KernelPenaltyEquality(spec.kernel, spec.schedule, spec.muP0, Ref(spec.muP0), ind, lcon[ind])
+    b = lcon[ind]
+    lambda = fill!(similar(b), zero(eltype(b)))   # λ₀ = 0 ⇒ φ_A == pure penalty (inert on non-ALM schedules)
+    return KernelPenaltyEquality(spec.kernel, spec.schedule, spec.muP0, Ref(spec.muP0), ind, b, lambda)
 end
 
 _is_kernel_penalty(::KernelPenaltyEquality) = true

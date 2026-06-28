@@ -225,26 +225,24 @@ color_status(status::Status) =
 update_penalty_mu!(solver::AbstractMadNLPSolver) = _update_penalty_mu!(get_cb(solver).equality_handler, solver)
 _update_penalty_mu!(::AbstractEqualityTreatment, solver) = nothing
 function _update_penalty_mu!(eh::KernelPenaltyEquality, solver::AbstractMadNLPSolver{T}) where T
-    muP_old = eh.muP[]
-    update_penalty!(eh.schedule, eh, solver)        # schedule's sole job: set eh.muP[]
-    if eh.muP[] != muP_old
-        # μ_P moved ⇒ the penalized merit varphi changed ⇒ the filter is stale. Reset it
-        # exactly like a μ_B update does (barrier.jl): the anchor (theta_max, -Inf) is
-        # penalty-independent (theta = ‖c-s-rhs‖₁), so it stays valid for ANY μ_P move
-        # (increase OR cliff-guard decrease).
+    changed = update_penalty!(eh.schedule, eh, solver)::Bool   # did φ_A move? (μ_P OR the AL multiplier λ)
+    if changed
+        # φ_A moved (μ_P and/or λ) ⇒ the penalized merit varphi changed ⇒ the filter is stale. Reset it
+        # exactly like a μ_B update does (barrier.jl): the anchor (theta_max, -Inf) is penalty-independent
+        # (theta = ‖c-s-rhs‖₁), so it stays valid for ANY φ_A move.
         empty!(get_filter(solver))
         push!(get_filter(solver), (get_theta_max(solver), -T(Inf)))
-        # Re-cache the penalty terms at the NEW μ_P so the whole Newton/line-search step is
-        # consistent: (i) slack(f) = φ'(s; μ_P_new) feeds the Newton RHS (set_aug_rhs!) and the
-        # line-search directional derivative; (ii) get_obj_val is the Armijo baseline varphi,
-        # re-evaluated at μ_P_new so it matches the trial merits. (D_s in set_aug_diagonal! and
-        # the trial objectives read eh.muP[] live, so they need no refresh.)
+        # Re-cache the penalty terms at the NEW φ_A so the whole Newton/line-search step is consistent:
+        # (i) slack(f) = φ'_A(s) = φ'(s;μ_P) + λ feeds the Newton RHS (set_aug_rhs!) and the line-search
+        # directional derivative; (ii) get_obj_val is the Armijo baseline varphi, re-evaluated so it matches
+        # the trial merits. (D_s = φ''_A = μ_P in set_aug_diagonal! reads eh.muP[] live, so it needs no refresh;
+        # the λ·s term is linear ⇒ Hessian unchanged.)
         penalty_gradient!(solver, eh, slack(get_f(solver)), slack(get_x(solver)))
         set_obj_val!(solver, eval_f_wrapper(solver, get_x(solver)))
     end
     return
 end
-update_penalty!(::FixedPenalty, eh, solver) = nothing
+update_penalty!(::FixedPenalty, eh, solver) = false   # never moves φ_A
 
 # Static (fixed-parameter) subproblem-gated continuation (see StaticContinuation in
 # equality_kernels.jl). Bump μ_P only when the penalty-barrier subproblem is solved
@@ -262,10 +260,129 @@ function update_penalty!(sched::StaticContinuation, eh::KernelPenaltyEquality, s
         if E_opt <= opt_tol && s_inf <= T(sched.s_thresh) / μ_next
             eh.muP[] = μ_next
             sched.n_bumps[] += 1
+            sched.muP_cur[] = eh.muP[]
+            return true                     # μ_P bumped ⇒ φ_A moved
         end
     end
     sched.muP_cur[] = eh.muP[]
-    return
+    return false
+end
+
+# Augmented Lagrangian (Hestenes–Powell method of multipliers) on the free equality slack — corrected
+# LANCELOT/Conn–Gould–Toint outer iteration that closes the certification gap. An OUTER step fires once
+# the inner penalty-barrier subproblem is solved to the current inner tol ω_k (get_inf_barrier ≤ ω_k)
+# OR has genuinely PLATEAUED (no get_inf_barrier improvement for stall_patience iters — a true
+# no-progress test, NOT a fixed iteration count). At each outer step we take the Hestenes–Powell step
+# λ ← clip(λ + μ_P·s) (unless it is a no-op), and SEPARATELY grow μ_P only on a CONSERVATIVE windowed
+# feasibility stall. Slack-row stationarity λ + μ_P·s = y ⇒ λ→y drives s=(y−λ)/μ_P → 0 at FINITE μ_P.
+# Keeping μ_P moderate keeps D_s = μ_P (and del_w) well-conditioned. Hessian D_s = μ_P unchanged (the
+# λ·s term is linear), so the condensed system stays SPD.
+#
+# Why the OLD logic failed (certification gap):
+#  • the freeze `s_inf ≤ tol && return false` halted λ BEFORE it reached y → the slack-row residual
+#    ‖λ+μ_P·s−y‖ (part of get_inf_du) floored above tol (mode A); and
+#  • the mutually-exclusive `improved-4× ? update-λ : bump-μ_P` mis-fired: once ‖s‖ plateaued at the
+#    fixed-λ equilibrium it BUMPED μ_P (→1e5–1e6) instead of updating λ, inflating del_w (mode A) and
+#    the condensed-system dynamic range so the inner x-solve crawled and the barrier stalled (mode B).
+# The fix keeps μ_P moderate (windowed bump + genuine-plateau gate) so neither floor appears, and
+# keeps updating λ→y (no premature freeze) so the slack-row stationarity and the slack both reach tol.
+function update_penalty!(sched::AugmentedLagrangian, eh::KernelPenaltyEquality, solver::AbstractMadNLPSolver{T}) where T
+    μ     = eh.muP[]
+    tol   = T(get_opt(solver).tol)
+    sview = view(slack(get_x(solver)), eh.ind_eqslack)
+    s_inf = isempty(eh.ind_eqslack) ? zero(T) : norm(sview, Inf)
+    sched.muP_cur[] = Float64(μ)
+
+    # Residual split. inf_du = max(x-row stationarity, slack-row stationarity). The schedule (λ-update
+    # and μ_P-bump) can ONLY move the SLACK-row stationarity stat = ‖λ+μ_P·s−y‖∞; the x-row/barrier
+    # part it cannot. `slack_binding` ⇒ the slack row is a meaningful chunk of inf_du, so acting can
+    # help; otherwise acting just churns the filter (and, for a bump, wrecks the D_s=μ_P conditioning).
+    idu  = get_inf_du(solver)
+    yv   = view(get_y(solver), eh.ind_eqslack)
+    stat = isempty(eh.ind_eqslack) ? zero(T) :
+           mapreduce((l, si, yi) -> abs(l + μ * si - yi), max, eh.lambda, sview, yv; init = zero(T))
+    slack_binding = stat > T(0.01) * idu
+
+    # ── AL fixed point ⇒ freeze φ_A (no λ move, no μ_P bump, no filter reset) ───────────────────────
+    # Freeze when equality feasibility is met (‖s‖∞ ≤ tol) AND the schedule can no longer usefully
+    # reduce inf_du: (i) ‖μ_P·s‖∞ ≤ tol (λ has converged to y; Hestenes step is a no-op), or
+    # (ii) get_inf_du ≤ tol (success imminent), or (iii) !slack_binding (inf_du is x-row/barrier
+    # dominated; a λ-update cannot lower it and would only churn the filter). This REPLACES the old
+    # `s_inf ≤ tol`-only freeze, which stranded λ short of y (the certification gap). In mode A,
+    # slack_binding holds (stat ≈ inf_du) so λ keeps updating until inf_du ≤ tol. The still-infeasible
+    # x-row stall (s > tol) is handled at the gate below, never frozen as a converged point.
+    s_inf <= tol && (μ * s_inf <= tol || idu <= tol || !slack_binding) && return false
+
+    # ── Inner-subproblem convergence / genuine-stall test ──────────────────────────────────────────
+    # Track the best (min) get_inf_barrier of the current inner solve. While it keeps improving (≥10%)
+    # the inner solve is making progress — do NOT take an outer step (forcing a step on a noisy
+    # mid-descent s spuriously inflates μ_P). Take an outer step only when the inner subproblem is
+    # solved to ω_k, OR has genuinely PLATEAUED (no improvement for stall_patience iters) AND the slack
+    # row is still the binding blocker. The plateau net breaks the certification deadlock (when μ_P·s
+    # and λ−y nearly cancel, inf_du floors ABOVE ω_k and a pure ω_k gate deadlocks): on a slack-bound
+    # plateau we FORCE the corrective λ-update at the equilibrium s (the floor). But on an x-row-bound
+    # plateau (a stalled x-solve) forcing an outer step only churns the filter and prevents the x-solve
+    # from un-stalling — so we leave φ_A frozen and let the IPM/barrier work (the moderate-μ_P bet).
+    E_inner = Float64(get_inf_barrier(solver))
+    if E_inner < 0.9 * sched.e_best[]
+        sched.e_best[]    = E_inner
+        sched.stall_cnt[] = 0
+    else
+        sched.stall_cnt[] += 1
+    end
+    inner_solved  = E_inner <= sched.omega[]
+    inner_stalled = sched.stall_cnt[] >= sched.stall_patience && slack_binding
+    (inner_solved || inner_stalled) || return false
+
+    sched.e_best[]    = Inf      # restart inner-progress tracking for the next subproblem
+    sched.stall_cnt[] = 0
+    changed = false
+
+    # ── (1) Hestenes–Powell multiplier update — DECOUPLED from (2) ──────────────────────────────────
+    # Skip only when the step is a no-op (‖μ_P·s‖∞ ≤ tol ⇒ λ already at y to tol): avoids a needless
+    # filter reset / endgame thrash. Otherwise update — this drives λ→y, collapses the slack-row
+    # stationarity ‖λ+μ_P·s−y‖, and (via s=(y−λ)/μ_P) the equality slack, at FINITE μ_P.
+    if μ * s_inf > tol
+        @views eh.lambda .= eh.lambda .+ μ .* sview
+        isfinite(sched.lambda_max) && clamp!(eh.lambda, -T(sched.lambda_max), T(sched.lambda_max))
+        sched.n_updates[] += 1
+        changed = true
+    end
+
+    # ── (2) Penalty increase — CONSERVATIVE, windowed, slack-row-gated, NEVER instead of (1) ────────
+    # Maintain an anchor (s_ref, n_anchor). Each outer step: if ‖s‖ contracted below eta_lambda·s_ref,
+    # re-anchor (the multiplier iteration is converging — DO NOT bump). Bump μ_P only when ‖s‖ fails to
+    # contract for `bump_patience` consecutive λ-updates (genuinely stalled at this μ_P) AND the slack
+    # row is the binding blocker. Growing μ_P when inf_du is x-row-dominated is futile (the slack row
+    # λ+μ_P·s≈y is already satisfied — feasibility is gated by a stalled x-solve, not a weak penalty)
+    # and wrecks the D_s=μ_P conditioning — the exact pathology that floored inf_du at μ_P=1e5–1e6.
+    # Keeping μ_P moderate instead lets the better-conditioned x-solve un-stall (the mode-B mechanism),
+    # and kills the early-transient false bumps that previously ballooned μ_P.
+    if s_inf > tol
+        if s_inf <= T(sched.eta_lambda) * T(sched.s_ref[])           # contracting → re-anchor, no bump
+            sched.s_ref[]    = Float64(s_inf)
+            sched.n_anchor[] = sched.n_updates[]
+        elseif slack_binding && (sched.n_updates[] - sched.n_anchor[]) >= sched.bump_patience && μ < sched.muP_max
+            μ_next = min(T(sched.muP_max), max(T(sched.kappa_P) * μ, μ^T(sched.theta_P)))
+            if μ_next != μ
+                eh.muP[] = μ_next
+                sched.n_bumps[] += 1
+                changed = true
+            end
+            sched.s_ref[]    = Float64(s_inf)                        # re-anchor after a bump
+            sched.n_anchor[] = sched.n_updates[]
+        end
+    else
+        sched.s_ref[]    = Float64(s_inf)                            # feasible → reset the anchor
+        sched.n_anchor[] = sched.n_updates[]
+    end
+
+    # ── (3) Tighten the inner tolerance ω_k toward ~tol (decoupled from μ_P) ────────────────────────
+    # The old ε_P = 1/μ_P could never tighten below 1/μ_P, capping ‖λ−y‖ at ~1/μ_P and forcing μ_P→∞.
+    # Geometric tightening; the stall net guarantees progress regardless of the exact ω_k.
+    sched.omega[]   = max(Float64(tol) / 10, sched.omega[] * sched.beta_omega)
+    sched.muP_cur[] = Float64(eh.muP[])
+    return changed
 end
 
 function regular!(solver::AbstractMadNLPSolver{T}) where T
@@ -292,8 +409,13 @@ function regular!(solver::AbstractMadNLPSolver{T}) where T
         # evaluate termination criteria
         @trace(get_logger(solver),"Evaluating termination criteria.")
         !(get_intermediate_callback(solver)(solver, UserCallbackRegular()) :: Bool) && return USER_REQUESTED_STOP
-        get_inf_total(solver) <= get_opt(solver).tol && return SOLVE_SUCCEEDED # success
-        get_inf_total(solver) <= get_opt(solver).acceptable_tol ?
+        # success requires the scaled KKT AND true equality feasibility ‖s_E‖∞≤tol (the freed penalty
+        # slack is not in get_inf_total; penalty_eq_feasible is a no-op for non-penalty treatments).
+        get_inf_total(solver) <= get_opt(solver).tol &&
+            penalty_eq_feasible(get_cb(solver).equality_handler, solver, get_opt(solver).tol) &&
+            return SOLVE_SUCCEEDED # success
+        (get_inf_total(solver) <= get_opt(solver).acceptable_tol &&
+         penalty_eq_feasible(get_cb(solver).equality_handler, solver, get_opt(solver).acceptable_tol)) ?
             (get_cnt(solver).acceptable_cnt < get_opt(solver).acceptable_iter ?
             get_cnt(solver).acceptable_cnt+=1 : return SOLVED_TO_ACCEPTABLE_LEVEL) : (get_cnt(solver).acceptable_cnt = 0) # if an acceptable tolerance enough times in a row is set, check.
         get_inf_total(solver) >= get_opt(solver).diverging_iterates_tol && return DIVERGING_ITERATES # diverged if E exceeds some large constant
