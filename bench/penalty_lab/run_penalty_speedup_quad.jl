@@ -1,0 +1,166 @@
+# QUAD-precision (Float128) re-run of two aggressive μ_P speed-up configs, to isolate how many of
+# their FP64 failures (INVALID_NUMBER cosh-overflow / SEARCH_DIR / DIVERGING) were finite-precision
+# CONDITIONING vs genuinely algorithmic. Quad lifts the cosh overflow ceiling μ_P·s from ~709 to
+# ~11356 and widens the mantissa.
+#
+#   bcoup_k10  : bcoupled (bump μ_P on μ_B drop), muP0=10, linear κ_P=10
+#   sgate_tP10 : s-gate only (bump μ_P iff ‖s_E‖∞ ≤ τ_P/μ_next), τ_P=10, linear κ_P=2, muP0=2
+#
+# Differences from the FP64 driver: T=Float128, CUTEstModel{Float128} (quadruple decode, cached),
+# linear_solver=LDLSolver (only Float128-capable), T-typed options.
+# Usage: julia --project=bench/penalty bench/penalty_lab/run_penalty_speedup_quad.jl [regime] [nworkers]
+
+using Distributed
+const HERE   = @__DIR__
+const PROJ   = abspath(joinpath(HERE, "..", "penalty"))
+const REGIME = length(ARGS) >= 1 ? ARGS[1] : "le500_eq"
+const NW     = min(length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 22, 23)
+
+using Quadmath
+const QT = Float128
+
+const CONFIGS = [
+    (name="bcoup_k10",  kind=:bcoup, tau_P=0.0,  kappa_P=10.0, theta_P=1.0, muP0=10.0),
+    (name="sgate_tP10", kind=:sgate, tau_P=10.0, kappa_P=2.0,  theta_P=1.0, muP0=2.0),
+]
+
+probs = String.(filter(!isempty, strip.(readlines(joinpath(HERE, "regimes", "$REGIME.txt")))))
+println("SPEEDUP-QUAD: regime=$REGIME problems=$(length(probs)) workers=$NW configs=$(length(CONFIGS)) (Float128)")
+
+using MadNLP, CUTEst, NLPModels
+const MASTSIF_PATH = ENV["MASTSIF"]
+isbuilt_q(name) = isfile(joinpath(CUTEst.libsif_path, "lib$(name)_quadruple.so"))
+println("pre-decoding (quad) $(count(!isbuilt_q, probs)) missing...")
+predecode_failed = String[]
+for (i,p) in enumerate(probs)
+    isbuilt_q(p) && continue
+    try; nlp = CUTEstModel{QT}(p); finalize(nlp); catch e; push!(predecode_failed, p); println("  DECODE FAIL $p"); end
+    i % 25 == 0 && println("  ...$i/$(length(probs))")
+end
+good = setdiff(probs, predecode_failed)
+println("quad pre-decode done; failed=$(length(predecode_failed)); solving $(length(good)) × $(length(CONFIGS))"); flush(stdout)
+
+addprocs(NW; exeflags = "--project=$(PROJ)")
+@everywhere ENV["MASTSIF"] = $(MASTSIF_PATH)
+@everywhere begin
+    using MadNLP, CUTEst, NLPModels, LinearAlgebra, Quadmath
+    const QT = Float128
+    const MAXWALL = 300.0
+    _san(s) = replace(string(s), r"[,\n\r]" => ";")
+
+    mutable struct SGateOnly <: MadNLP.AbstractPenaltySchedule
+        kappa_P::Float64; theta_P::Float64; tau_P::Float64; muP_max::Float64
+        n_muP::Int; n_muB::Int
+        muP_cur::Base.RefValue{Float64}; last_muB::Base.RefValue{Float64}
+    end
+    SGateOnly(; kappa_P, theta_P=1.0, tau_P, muP_max=1.0e7) =
+        SGateOnly(kappa_P, theta_P, tau_P, muP_max, 0, 0, Ref(NaN), Ref(NaN))
+    function MadNLP.update_penalty!(s::SGateOnly, eh::KernelPenaltyEquality,
+                                    solver::MadNLP.AbstractMadNLPSolver{T}) where T
+        μB = Float64(MadNLP.get_mu(solver))
+        (!isnan(s.last_muB[]) && μB < s.last_muB[]) && (s.n_muB += 1)
+        s.last_muB[] = μB
+        μ = eh.muP[]
+        if μ < s.muP_max
+            μ_next = min(T(s.muP_max), max(T(s.kappa_P)*μ, μ^T(s.theta_P)))
+            sE = isempty(eh.ind_eqslack) ? zero(T) :
+                 norm(view(MadNLP.slack(MadNLP.get_x(solver)), eh.ind_eqslack), Inf)
+            if sE <= T(s.tau_P) / μ_next
+                eh.muP[] = μ_next; s.n_muP += 1
+            end
+        end
+        s.muP_cur[] = Float64(eh.muP[])
+        return
+    end
+
+    mutable struct BCoupled <: MadNLP.AbstractPenaltySchedule
+        kappa_P::Float64; theta_P::Float64; muP_max::Float64
+        n_muP::Int; n_muB::Int
+        muP_cur::Base.RefValue{Float64}; last_muB::Base.RefValue{Float64}
+    end
+    BCoupled(; kappa_P, theta_P=1.0, muP_max=1.0e7) =
+        BCoupled(kappa_P, theta_P, muP_max, 0, 0, Ref(NaN), Ref(NaN))
+    function MadNLP.update_penalty!(s::BCoupled, eh::KernelPenaltyEquality,
+                                    solver::MadNLP.AbstractMadNLPSolver{T}) where T
+        μB = Float64(MadNLP.get_mu(solver))
+        if !isnan(s.last_muB[]) && μB < s.last_muB[]
+            s.n_muB += 1
+            if eh.muP[] < s.muP_max
+                eh.muP[] = min(T(s.muP_max), max(T(s.kappa_P)*eh.muP[], eh.muP[]^T(s.theta_P)))
+                s.n_muP += 1
+            end
+        end
+        s.last_muB[] = μB
+        s.muP_cur[]  = Float64(eh.muP[])
+        return
+    end
+
+    function _eqfeas(nlp, x)
+        m = NLPModels.get_ncon(nlp); m == 0 && return 0.0
+        c = similar(x, m); NLPModels.cons!(nlp, x, c)
+        lc = NLPModels.get_lcon(nlp); uc = NLPModels.get_ucon(nlp)
+        return Float64(maximum(abs.(c .- lc) .* (lc .== uc)))
+    end
+    _err(name, nv, nc, st) = (name=name, nvar=nv, ncon=nc, status=st, iter=-1, nfact=-1,
+        time=0.0, eqfeas=NaN, obj=NaN, muP_final=NaN, n_muP=-1, n_muB=-1)
+    function solve_one(name::AbstractString, cfg)
+        local nlp
+        try; nlp = CUTEstModel{QT}(name; decode=false)
+        catch e; return _err(name, -1, -1, "LOAD_ERROR:"*_san(first(split(sprint(showerror,e),'\n')))); end
+        sched = cfg.kind === :sgate ?
+            SGateOnly(kappa_P=cfg.kappa_P, theta_P=cfg.theta_P, tau_P=cfg.tau_P) :
+            BCoupled(kappa_P=cfg.kappa_P, theta_P=cfg.theta_P)
+        treat = KernelPenaltyEquality(CoshKernel(); schedule=sched, muP=QT(cfg.muP0))
+        try
+            nvar, ncon = nlp.meta.nvar, nlp.meta.ncon
+            t = @elapsed r = madnlp(nlp; kkt_system=MadNLP.SparseCondensedKKTSystem,
+                                    linear_solver=MadNLP.LDLSolver, tol=QT(1e-8),
+                                    acceptable_tol=QT(1e-8), max_wall_time=QT(MAXWALL),
+                                    equality_treatment=treat, print_level=MadNLP.ERROR)
+            return (name=name, nvar=nvar, ncon=ncon, status=string(r.status), iter=r.iter,
+                    nfact=r.counters.factorization_cnt, time=t, eqfeas=_eqfeas(nlp, r.solution),
+                    obj=Float64(r.objective), muP_final=sched.muP_cur[], n_muP=sched.n_muP, n_muB=sched.n_muB)
+        catch e
+            r = _err(name, nlp.meta.nvar, nlp.meta.ncon, "ERROR:"*_san(first(split(sprint(showerror,e),'\n'))))
+            return merge(r, (muP_final=sched.muP_cur[], n_muP=sched.n_muP, n_muB=sched.n_muB))
+        finally
+            finalize(nlp)
+        end
+    end
+end
+
+outdir = joinpath(HERE, "results", "penalty_speedup_quad"); mkpath(outdir)
+cols = (:name,:nvar,:ncon,:status,:iter,:nfact,:time,:eqfeas,:obj,:muP_final,:n_muP,:n_muB)
+gm(v) = (w=filter(>(0), v); isempty(w) ? NaN : exp(sum(log, w)/length(w)))
+med(v) = (w=sort(v); isempty(w) ? NaN : w[cld(length(w),2)])
+summ = NamedTuple[]
+for (ci,c) in enumerate(CONFIGS)
+    println("\n[$ci/$(length(CONFIGS))] $(c.name)  kind=$(c.kind) τ_P=$(c.tau_P) κ_P=$(c.kappa_P) θ_P=$(c.theta_P) muP0=$(c.muP0)"); flush(stdout)
+    results = pmap(p -> solve_one(p, c), good;
+                   on_error = ex -> (:__EXC, string(typeof(ex)), first(split(sprint(showerror,ex),'\n'))))
+    csv = joinpath(outdir, "$(REGIME)__$(c.name).csv")
+    open(csv, "w") do io
+        println(io, join(cols, ","))
+        for p in predecode_failed
+            println(io, join((p,-1,-1,"DECODE_ERROR",-1,-1,0.0,NaN,NaN,NaN,-1,-1), ","))
+        end
+        for (p,res) in zip(good, results)
+            row = res isa NamedTuple ? res :
+                  (name=p,nvar=-1,ncon=-1,status=(res isa Tuple ? _san("CRASH:"*res[3]) : "CRASH"),
+                   iter=-1,nfact=-1,time=0.0,eqfeas=NaN,obj=NaN,muP_final=NaN,n_muP=-1,n_muB=-1)
+            println(io, join((row[col] for col in cols), ","))
+        end
+    end
+    rows = [r for r in results if r isa NamedTuple]
+    succ = [r for r in rows if r.status=="SOLVE_SUCCEEDED"]
+    tight = count(r -> r.status=="SOLVE_SUCCEEDED" && r.eqfeas<=1e-8, rows)
+    gmf = gm([Float64(r.nfact) for r in succ]); mbump = med([r.n_muP for r in rows if r.n_muP>=0])
+    push!(summ, (name=c.name, n=length(rows), tight=tight, succ=length(succ), gm_nfact=gmf, med_muP=mbump))
+    println("  → TIGHT=$tight SUCC=$(length(succ)) geomean_nfact=$(round(gmf,digits=1)) med_muP_bumps=$mbump"); flush(stdout)
+    open(joinpath(outdir, "summary_speedup_quad.csv"), "w") do io
+        println(io, "config,n,tight,succeeded,geomean_nfact_solved,median_muP_bumps")
+        for s in summ; println(io, join((s.name,s.n,s.tight,s.succ,round(s.gm_nfact,digits=2),s.med_muP), ",")); end
+    end
+end
+println("\n(FP64 refs: bcoup_k10 = 26 tight/26 succ ; sgate_tP10 = 30 tight/34 succ)")
+println("PENALTY_SPEEDUP_QUAD_DONE")
