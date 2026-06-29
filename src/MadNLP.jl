@@ -1,7 +1,7 @@
 module MadNLP
 
 import Pkg.TOML: parsefile
-import Printf: @sprintf
+import Printf: @sprintf, @printf
 import LinearAlgebra: BLAS, LAPACK, Adjoint, Symmetric, Diagonal, mul!, ldiv!, rdiv!, lmul!, rmul!, norm, dot, diagind, normInf, transpose!, issuccess
 import LinearAlgebra: BlasReal, bunchkaufman, cholesky, qr, lu, bunchkaufman!, cholesky!, axpy!, LowerTriangular
 import LinearAlgebra.BLAS: libblastrampoline, BlasInt, @blasfunc
@@ -15,6 +15,8 @@ import LDLFactorizations
 import MUMPS_seq_jll, OpenBLAS32_jll
 
 export MadNLPSolver, MadNLPOptions, LDLSolver, LapackCPUSolver, MumpsSolver, MadNLPExecutionStats, madnlp, solve!, madsuite, SchurComplementKKTSystem
+export AbstractKernel, QuadraticKernel, CoshKernel                          # NCL kernels
+export madncl, NCLModel, NCLOptions, K2rAuglagKKTSystem, K1sAuglagKKTSystem  # kernel-NCL driver (faithful port)
 Base.USE_GPL_LIBS && export UmfpackSolver, CHOLMODSolver
 
 function __init__()
@@ -32,15 +34,23 @@ introduce() = "\033[34mMad\033[31mN\033[32mL\033[35mP\033[0m version v$(version(
 include("enums.jl")
 include("utils.jl")
 include("matrixtools.jl")
+include(joinpath("NCL", "kernels.jl"))      # AbstractKernel/QuadraticKernel/CoshKernel — before the KernelNCL treatment
 include(joinpath("Callbacks", "nlpmodels.jl"))
+include(joinpath("NCL", "scaled.jl"))       # ScaledModel — after set_con_scale_sparse! is defined
+include(joinpath("NCL", "ncl.jl"))          # NCLModel (kernel-NCL augmented model)
 include(joinpath("Callbacks", "wrappers.jl"))
 include("quasi_newton.jl")
 include(joinpath("KKT", "KKTsystem.jl"))
+include(joinpath("NCL", "utils.jl"))        # symul! (used by the NCL KKT systems)
+include(joinpath("NCL", "k2r.jl"))          # K2rAuglagKKTSystem (stabilized augmented, no-pivot LDL)
+include(joinpath("NCL", "k1s.jl"))          # K1sAuglagKKTSystem (condensed SPD, no-pivot Cholesky)
 include(joinpath("LinearSolvers", "linearsolvers.jl"))
 include(joinpath("IPM", "IPM.jl"))
+include(joinpath("NCL", "solver.jl"))       # NCL outer driver: madncl, NCLOptions, NCLSolver, NCLStats
 include("precompile.jl")
 
 madsuite(::Val{:madnlp}, args...; kwargs...) = madnlp(args...; kwargs...)
+madsuite(::Val{:madncl}, args...; kwargs...) = madncl(args...; kwargs...)
 
 global Optimizer
 

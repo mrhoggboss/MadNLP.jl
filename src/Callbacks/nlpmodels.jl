@@ -105,6 +105,55 @@ constraints only up to a tolerance ``ϵ``.
 struct RelaxEquality <: AbstractEqualityTreatment end
 
 """
+    KernelNCL(kernel = QuadraticKernel(); scaled_arg = true, rho = 1e2)
+
+Treat each equality ``c_E(x) = b`` by the **method of multipliers** (kernel-agnostic NCL):
+introduce a free relaxation residual as an *unbounded slack* ``s`` (coupling ``c_E(x) - s = b``,
+no log-barrier on ``s``) carrying the penalty ``ykᵀ s + (1/ρ) Σ φ(ρ sᵢ)`` (convention A,
+`scaled_arg=true`; ``s = -r`` relative to the reference residual ``c(x)+r=b``). The penalty
+Hessian ``ρΣ = ρ φ''(ρ s)`` rides `pr_diag`, so the saddle stays factorizable. The multiplier
+estimate `yk` and penalty `ρ` are advanced by the NCL outer driver (`madncl`), NOT inside the
+IPM. `QuadraticKernel` recovers classic quadratic NCL bit-for-bit.
+
+Pass a constructed instance, e.g. `madncl(nlp; kernel = CoshKernel())` (which builds the
+handler internally). Supported only with `SparseCallback`.
+"""
+struct KernelNCL{T, VT, VI, K<:AbstractKernel} <: AbstractEqualityTreatment
+    kernel::K
+    scaled_arg::Bool
+    ind_eqslack::VI          # positions of the equality rows within the slack vector
+    b::VT                    # equality targets (length == length(ind_eqslack))
+    yk::VT                   # multiplier estimate, one per eq slack (advanced by the outer driver)
+    ρ::Base.RefValue{T}      # current penalty parameter (mutable; advanced by the outer driver)
+end
+
+# User-facing constructor: a *spec* (kernel + convention + initial ρ). The model-sized
+# fields (`ind_eqslack`, `b`, `yk`) are empty until `create_equality_handler` sizes them.
+function KernelNCL(kernel::AbstractKernel = QuadraticKernel(); scaled_arg::Bool = true, rho::Real = 1e2)
+    T = typeof(float(rho))
+    return KernelNCL(kernel, scaled_arg, Int[], T[], T[], Ref(T(rho)))
+end
+
+# Materialize the equality handler against the model. A treatment passed as a *type*
+# (e.g. the default `EnforceEquality`) or as a singleton *instance* passes through; a
+# `KernelNCL` *spec* is sized — `ind_eqslack`/`b`/`yk` are filled from the equality rows
+# (`lcon == ucon`), in the model's array types (GPU-ready).
+create_equality_handler(t::Type{<:AbstractEqualityTreatment}, lcon, ucon) = t()
+create_equality_handler(h::AbstractEqualityTreatment, lcon, ucon) = h
+create_equality_handler(::Type{<:KernelNCL}, lcon, ucon) =
+    create_equality_handler(KernelNCL(), lcon, ucon)
+function create_equality_handler(spec::KernelNCL, lcon, ucon)
+    ind = findall(lcon .== ucon)
+    b = lcon[ind]
+    yk = fill!(similar(b), one(eltype(b)))   # yk₀ = 1 (mirrors the reference NCLModel; the
+    return KernelNCL(spec.kernel, spec.scaled_arg, ind, b, yk, Ref(spec.ρ[]))  # outer driver
+end                                          # overwrites yk .= ipm.y right after initialize!.
+
+_is_kernel_ncl(::KernelNCL) = true
+_is_kernel_ncl(::Type{<:KernelNCL}) = true
+_is_kernel_ncl(::Any) = false
+
+"""
     AbstractCallback{T, VT}
 
 Wrap the `AbstractNLPModel` passed by the user in a form amenable to MadNLP.
@@ -366,10 +415,10 @@ function create_sparse_fixed_handler(
     return fixed_handler, n, get_nnzj(nlp.meta), get_nnzh(nlp.meta)
 end
 
-function _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
+function _parse_indexes(lvar, uvar, lcon, ucon, equality_handler)
     m = length(lcon)
     if m > 0
-        if equality_treatment == EnforceEquality
+        if equality_handler isa EnforceEquality
             is_equality = lcon .== ucon
             ind_eq = findall(is_equality)
             ind_ineq = findall(~, is_equality)
@@ -379,6 +428,14 @@ function _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
         end
         xl = [lvar; view(lcon, ind_ineq)]
         xu = [uvar; view(ucon, ind_ineq)]
+        if equality_handler isa KernelNCL
+            # Free the NCL relaxation slacks (no log-barrier): make their bounds ±Inf
+            # *before* ind_lb/ind_ub are computed below, so they are excluded from the
+            # bound-barrier index sets (which are frozen here and never recomputed).
+            nx = length(lvar)
+            @views xl[nx .+ equality_handler.ind_eqslack] .= -Inf
+            @views xu[nx .+ equality_handler.ind_eqslack] .=  Inf
+        end
     else
         ind_eq = similar(lvar, Int, 0)
         ind_ineq = similar(lvar, Int, 0)
@@ -451,7 +508,6 @@ function create_callback(
         hess_J,
         hess_buffer,
     )
-    equality_handler = equality_treatment()
 
     jac_scale = similar(jac_buffer, nnzj)
     fill!(jac_scale, one(T))
@@ -475,7 +531,11 @@ function create_callback(
         uvar = uvar[ind_free]
     end
 
-    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
+    # Materialize the equality handler now that the model bounds are available (a
+    # `KernelNCL` spec is sized against the equality rows here).
+    equality_handler = create_equality_handler(equality_treatment, lcon, ucon)
+
+    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_handler)
 
     return SparseCallback(
         nlp,
@@ -525,8 +585,12 @@ function create_callback(
     con_scale = similar(x0, m)
     fill!(con_scale, one(T))
 
+    _is_kernel_ncl(equality_treatment) && error(
+        "KernelNCL is only supported with SparseCallback " *
+        "(SparseKKTSystem / SparseCondensedKKTSystem / K2rNCLKKTSystem / K1sNCLKKTSystem), " *
+        "not the dense callback."
+    )
     fixed_handler = create_dense_fixed_handler(fixed_variable_treatment, nlp)
-    equality_handler = equality_treatment()
 
     # Get indexing
     lvar = get_lvar(nlp)
@@ -534,7 +598,8 @@ function create_callback(
     lcon = get_lcon(nlp)
     ucon = get_ucon(nlp)
 
-    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_treatment)
+    equality_handler = create_equality_handler(equality_treatment, lcon, ucon)
+    indexes = _parse_indexes(lvar, uvar, lcon, ucon, equality_handler)
 
     # Get fixed variables
     ind_fixed = findall(lvar .== uvar)
@@ -575,6 +640,24 @@ end
 function _treat_equality_initialize!(equality_handler::EnforceEquality, lcon, ucon, tol) end
 function _treat_equality_initialize!(equality_handler::RelaxEquality, lcon, ucon, tol)
     return set_initial_bounds!(lcon, ucon, tol)
+end
+# NCL equalities: keep the lcon/ucon copies intact (so `rhs .= (lcon.==ucon).*lcon` still
+# recovers `b`); all NCL-specific slack init is centralized in `_finalize_ncl_initialize!`,
+# run at the end of `initialize!`.
+function _treat_equality_initialize!(equality_handler::KernelNCL, lcon, ucon, tol) end
+
+# Override the generic slack init for NCL relaxation slacks: free their bounds (no barrier),
+# keep the equality target `rhs = b`, and start the residual at `s = 0` (= reference r₀ = 0).
+# The initial equality residual `c(x0) - b` then enters as primal infeasibility (inf_pr) —
+# the ordinary infeasible-start situation. No-op for other treatments.
+_finalize_ncl_initialize!(::AbstractEqualityTreatment, xl, xu, rhs, x, con_buffer) = nothing
+function _finalize_ncl_initialize!(eh::KernelNCL{T}, xl, xu, rhs, x, con_buffer) where {T}
+    es = eh.ind_eqslack
+    @views slack(xl)[es] .= -T(Inf)
+    @views slack(xu)[es] .=  T(Inf)
+    @views rhs[es]       .= eh.b
+    @views slack(x)[es]  .= zero(T)            # s = 0 (was c(x0)-b)
+    return
 end
 # Initiate fixed variables. By default, do nothing.
 function _treat_fixed_variable_initialize!(cb::AbstractCallback, x0, lvar, uvar) end
@@ -632,6 +715,8 @@ function initialize!(
 
     set_initial_bounds!(slack(xl), slack(xu), tol)
     initialize_variables!(slack(x), slack(xl), slack(xu), bound_push, bound_fac)
+
+    _finalize_ncl_initialize!(cb.equality_handler, xl, xu, rhs, x, con_buffer)
     return
 end
 

@@ -1,3 +1,48 @@
+# ---- Kernel-NCL penalty injection (convention A; `KernelNCL` treatment) ------------------
+# The relaxation residual is the free slack `s = c_E(x) - b = -r` (r = the reference NCLModel
+# residual `c(x)+r=b`). In slack space, convention A (`scaled_arg=true`) reads:
+#   objective:  (1/ρ) Σ φ(ρ sᵢ) + ykᵀ s
+#   gradient:   ∂/∂sᵢ = φ'(ρ sᵢ) + ykᵢ            (= -gr bit-for-bit; see src/NCL/k2r.jl)
+#   Hessian:    ∂²/∂sᵢ² = ρ φ''(ρ sᵢ) = (ρΣ)ᵢᵢ    (injected onto pr_diag, src/IPM/kernels.jl)
+# `yk` and `ρ` are advanced by the NCL outer driver between subproblem solves. Everything
+# dispatches to no-ops/zeros for any other treatment, so non-NCL solves are untouched. The
+# kernels are not overflow-safe; a non-finite penalty is caught by MadNLP's standard
+# `is_valid` checks (as in the reference NCLModel path) — no custom guard needed.
+
+# φ-sum over the eq-slacks (no linear term); quad uses the exact closed form for bit-for-bit.
+@inline function _ncl_penalty_obj(kernel::AbstractKernel, scaled_arg::Bool, ρ::T, se) where {T}
+    if scaled_arg
+        return mapreduce(si -> phi(kernel, ρ * si), +, se; init=zero(T)) / ρ
+    else
+        return ρ * mapreduce(si -> phi(kernel, si), +, se; init=zero(T))
+    end
+end
+@inline _ncl_penalty_obj(::QuadraticKernel, ::Bool, ρ::T, se) where {T} = ρ * dot(se, se) / T(2)
+
+penalty_objective(::AbstractEqualityTreatment, s) = zero(eltype(s))
+function penalty_objective(eh::KernelNCL, s)
+    se = view(s, eh.ind_eqslack)
+    return _ncl_penalty_obj(eh.kernel, eh.scaled_arg, eh.ρ[], se) + dot(eh.yk, se)
+end
+
+# Strip the penalty back out → true model objective f(x) in MadNLP's internal (scaled,
+# sign-flipped) space, for reporting. No-op (subtracts 0) for non-NCL treatments.
+true_obj_val(solver) = get_obj_val(solver) - penalty_objective(get_cb(solver).equality_handler, slack(get_x(solver)))
+
+penalty_gradient!(::AbstractEqualityTreatment, sf, s) = nothing
+function penalty_gradient!(eh::KernelNCL, sf, s)
+    es = eh.ind_eqslack
+    ρ = eh.ρ[]
+    se = view(s, es)
+    # Overwrite (not accumulate): slack(f) persists across iterations and is otherwise 0.
+    if eh.scaled_arg
+        @views sf[es] .= dphi.(Ref(eh.kernel), ρ .* se) .+ eh.yk     # φ'(ρ s) + yk = -gr
+    else
+        @views sf[es] .= ρ .* dphi.(Ref(eh.kernel), se) .+ eh.yk
+    end
+    return
+end
+
 function eval_f_wrapper(solver::AbstractMadNLPSolver{T}, x::PrimalVector{T}) where T
     nlp = get_nlp(solver)
     cnt = get_cnt(solver)
@@ -8,6 +53,13 @@ function eval_f_wrapper(solver::AbstractMadNLPSolver{T}, x::PrimalVector{T}) whe
         # to the user (in MadNLPExecutionStats) we flip it back (#517).
         sense = (get_minimize(nlp) ? one(T) : -one(T))
         obj_val = sense * _eval_f_wrapper(get_cb(solver), variable(x))
+        # Add the equality penalty in the (minimized) internal objective space so the
+        # filter / merit see it. Gated on `isa KernelNCL` so the branch is compile-time
+        # eliminated (zero added code/allocations) for every other treatment.
+        eh = get_cb(solver).equality_handler
+        if eh isa KernelNCL
+            obj_val += penalty_objective(eh, slack(x))
+        end
     end
     cnt.obj_cnt += 1
     if cnt.obj_cnt == 1 && !is_valid(obj_val)
@@ -28,6 +80,11 @@ function eval_grad_f_wrapper!(solver::AbstractMadNLPSolver, f::PrimalVector{T}, 
     if !get_minimize(nlp)
         variable(f) .*= -one(T)
     end
+    # Penalty gradient on the equality slacks → KKT RHS and dual-infeasibility (both read
+    # full(f)). Stationarity on those rows becomes φ'(ρ s) + yk = 0. Gated on `isa KernelNCL`
+    # so it is compile-time eliminated (zero added code/allocations) for non-NCL treatments.
+    eh = get_cb(solver).equality_handler
+    eh isa KernelNCL && penalty_gradient!(eh, slack(f), slack(x))
     cnt.obj_grad_cnt+=1
 
     if cnt.obj_grad_cnt == 1 && !is_valid(full(f))

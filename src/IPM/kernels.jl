@@ -16,6 +16,28 @@ function set_aug_diagonal!(kkt::AbstractKKTSystem{T}, solver::AbstractMadNLPSolv
     copyto!(kkt.u_lower, get_zu_r(solver))
 
     _set_aug_diagonal!(kkt)
+    # Inject the NCL penalty Hessian ρΣ onto the equality-slack diagonal. Done after the
+    # barrier diagonal so every assembly phase (regular/restore/robust/dual-init) gets it;
+    # build_kkt! then folds it into the augmented / condensed (1,1) block. Gated on
+    # `isa KernelNCL` so it is compile-time eliminated (zero added code) for non-NCL treatments.
+    eh = get_cb(solver).equality_handler
+    eh isa KernelNCL && add_penalty_diagonal!(kkt, solver, eh, slack(get_x(solver)))
+    return
+end
+
+# Convention A: pr_diag[eqslack] += ρ φ''(ρ s) (= ρΣ). Quad ⇒ ρ·1 = ρ. No-op otherwise.
+add_penalty_diagonal!(kkt, solver, ::AbstractEqualityTreatment, s) = nothing
+function add_penalty_diagonal!(kkt, solver, eh::KernelNCL, s)
+    n = length(kkt.pr_diag) - length(s)        # number of (non-slack) primal variables
+    es = eh.ind_eqslack
+    ρ = eh.ρ[]
+    se = view(s, es)
+    dview = view(kkt.pr_diag, n .+ es)
+    if eh.scaled_arg
+        dview .+= ρ .* ddphi.(Ref(eh.kernel), ρ .* se)
+    else
+        dview .+= ρ .* ddphi.(Ref(eh.kernel), se)
+    end
     return
 end
 
